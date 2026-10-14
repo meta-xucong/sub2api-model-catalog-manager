@@ -1,0 +1,26 @@
+# Runtime files and secrets
+/config-*.json
+/model-rules*.json
+/state*/
+/reports*/
+/logs/
+/backups*/
+/bin/
+/secrets/
+*.dpapi
+*.key
+*.log
+*.exe
+*.test
+*.out
+*.tmp
+
+/.cache/
+/cache/
+/.gocache*/
+/.tmp*/
+/tmp*/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
