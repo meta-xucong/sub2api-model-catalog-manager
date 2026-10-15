@@ -1286,6 +1286,12 @@ func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
 
 func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(t *testing.T) {
 	cfg, selected, now := testWorkflowConfig(t, true, true)
+	clock := now
+	advancingNow := func() time.Time {
+		current := clock
+		clock = clock.Add(time.Nanosecond)
+		return current
+	}
 	cfg.AccountScope = "all"
 	cfg.Accounts = nil
 	cfg.AcceptAllCredentialResponseMemoryExposure = true
@@ -1322,9 +1328,12 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(
 		accounts: map[int64]adminapi.Account{selected.ID: selected, unsupported.ID: unsupported, inactive.ID: inactive, shadow.ID: shadow, unrestricted.ID: unrestricted},
 		catalogs: map[int64]adminapi.Catalog{selected.ID: {Models: []string{"new-model", "keep-model"}, LiveListAvailable: true}},
 	}
-	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
+	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: advancingNow, FullScreen: true}).Discover(context.Background(), cfg)
 	if err != nil || discovery.Plan == nil {
 		t.Fatalf("full-screen discovery failed: plan=%#v err=%v", discovery.Plan, err)
+	}
+	if got := discovery.Plan.ExpiresAt.Sub(discovery.Plan.CreatedAt); got != catalog.ApprovalPlanTTL {
+		t.Fatalf("full-screen plan validity window = %s, want exactly %s", got, catalog.ApprovalPlanTTL)
 	}
 	if !discovery.Report.FullAccountScreen || discovery.Report.AccountScanStatus != "complete" || discovery.Report.AccountInventoryCount != 5 || len(discovery.Report.Discovery) != 5 {
 		t.Fatalf("full-screen run did not cover the complete inventory: %#v", discovery.Report)
@@ -1351,7 +1360,7 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(
 		t.Fatalf("summary mapping status collapsed unrestricted/empty or shadow accounts: unrestricted=%#v shadow=%#v", discoveryRows[unrestricted.ID], discoveryRows[10])
 	}
 
-	applier := workflowApplier(api, now)
+	applier := workflowApplier(api, clock)
 	applier.FullScreen = true
 	result, err := applier.Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, "", true)
 	if err != nil {

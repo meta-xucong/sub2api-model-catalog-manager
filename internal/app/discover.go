@@ -301,10 +301,11 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 	for _, item := range status.Accounts {
 		accountsByID[item.AccountID] = item
 	}
+	createdAt := now().UTC()
 	approval := catalog.ApprovalPlan{
 		SchemaVersion: catalog.ApprovalPlanSchemaVersion,
-		CreatedAt:     now().UTC(),
-		ExpiresAt:     now().UTC().Add(catalog.ApprovalPlanTTL),
+		CreatedAt:     createdAt,
+		ExpiresAt:     createdAt.Add(catalog.ApprovalPlanTTL),
 		Target:        catalog.TargetBinding{Origin: normalizedOrigin(cfg.Target.BaseURL), BuildID: cfg.Target.RuntimeCompatibility.BuildID, APIContractID: cfg.Target.RuntimeCompatibility.APIContractID},
 		AccountScope:  cfg.AccountScopeValue(),
 		RulesSHA256:   rulesHash,
