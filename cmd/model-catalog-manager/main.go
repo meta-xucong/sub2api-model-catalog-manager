@@ -13,7 +13,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -501,7 +503,146 @@ func runAutomaticWithStartup(args []string, startup startupPass) error {
 	return runAutomaticPreparedWithStartup(args, securecred.Read, makeClient, startup)
 }
 
+type fullScreenResult struct {
+	SchemaVersion     int    `json:"schema_version"`
+	Status            string `json:"status"`
+	ReasonCode        string `json:"reason_code"`
+	PlannedCount      int    `json:"planned_count"`
+	AppliedCount      int    `json:"applied_count"`
+	NoopCount         int    `json:"noop_count"`
+	FailedCount       int    `json:"failed_count"`
+	NotAttemptedCount int    `json:"not_attempted_count"`
+	SummaryBasename   string `json:"summary_basename"`
+}
+
+var screenSummaryBasenamePattern = regexp.MustCompile(`^screen-summary-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{32}\.md$`)
+
 func runAutomaticPreparedWithStartup(args []string, readCredential app.CredentialReader, newClient app.ClientFactory, startup startupPass) error {
+	fullScreen, invalidFullScreenValue := fullScreenFlagState(args)
+	if invalidFullScreenValue {
+		terminal := fullScreenResult{SchemaVersion: 1, Status: "failed", ReasonCode: "configuration_invalid"}
+		if err := json.NewEncoder(os.Stdout).Encode(terminal); err != nil {
+			return errors.New("full-screen result could not be written")
+		}
+		return errors.New("run received an invalid --full-screen boolean value")
+	}
+	if !fullScreen {
+		return runAutomaticCore(args, readCredential, newClient, startup, nil)
+	}
+	terminal := fullScreenResult{SchemaVersion: 1, Status: "failed", ReasonCode: "configuration_invalid"}
+	err := runAutomaticCore(args, readCredential, newClient, startup, &terminal)
+	if !validFullScreenReason(terminal.ReasonCode) {
+		terminal.ReasonCode = "configuration_invalid"
+		terminal.Status = "failed"
+	}
+	if terminal.Status == "" {
+		terminal.Status = "failed"
+	}
+	if terminal.SummaryBasename != "" && !screenSummaryBasenamePattern.MatchString(terminal.SummaryBasename) {
+		terminal.SummaryBasename = ""
+	}
+	if encodeErr := json.NewEncoder(os.Stdout).Encode(terminal); encodeErr != nil {
+		return errors.New("full-screen result could not be written")
+	}
+	return err
+}
+
+func requestsFullScreen(args []string) bool {
+	enabled, _ := fullScreenFlagState(args)
+	return enabled
+}
+
+func fullScreenFlagState(args []string) (enabled, invalid bool) {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--full-screen" || arg == "-full-screen" {
+			enabled = true
+			continue
+		}
+		for _, prefix := range []string{"--full-screen=", "-full-screen="} {
+			if strings.HasPrefix(arg, prefix) {
+				value, err := strconv.ParseBool(strings.TrimPrefix(arg, prefix))
+				if err != nil {
+					return enabled, true
+				}
+				enabled = value
+				break
+			}
+		}
+	}
+	return enabled, false
+}
+
+func validFullScreenReason(code string) bool {
+	switch code {
+	case "completed", "no_applicable_plan", "account_scan_partial", "native_refresh_running", "native_refresh_status_unavailable", "native_refresh_status_unknown", "manager_lock_requires_review", "configuration_invalid", "credential_unavailable", "discovery_failed", "approved_rules_blocked", "apply_partial", "apply_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func isManagerLockReviewError(err error) bool {
+	return err != nil && err.Error() == "another run may be active or a prior lock needs manual review"
+}
+
+func fullScreenApplyFailure(err error, result app.ApplyResult) (string, string) {
+	status, reason := "failed", "apply_failed"
+	var gate interface{ ReasonCode() string }
+	switch {
+	case errors.As(err, &gate):
+		reason = gate.ReasonCode()
+		if len(result.AppliedIDs) > 0 {
+			status = "partial"
+		} else {
+			status = "blocked"
+		}
+	case isManagerLockReviewError(err):
+		if len(result.AppliedIDs) > 0 {
+			status, reason = "partial", "apply_partial"
+		} else {
+			status, reason = "blocked", "manager_lock_requires_review"
+		}
+	case len(result.AppliedIDs) > 0:
+		status, reason = "partial", "apply_partial"
+	case strings.Contains(err.Error(), "administrator credential could not be read"):
+		reason = "credential_unavailable"
+	}
+	return status, reason
+}
+
+func (r *fullScreenResult) set(status, reason string, plan *catalog.ApprovalPlan, applied app.ApplyResult, summaryPath string) {
+	if r == nil {
+		return
+	}
+	r.Status = status
+	r.ReasonCode = reason
+	r.PlannedCount = 0
+	if plan != nil {
+		r.PlannedCount = len(plan.Accounts)
+	}
+	r.AppliedCount = len(applied.AppliedIDs)
+	r.NoopCount = len(applied.NoopIDs)
+	r.FailedCount = 0
+	if applied.FailedID > 0 {
+		r.FailedCount = 1
+	}
+	r.NotAttemptedCount = r.PlannedCount - r.AppliedCount - r.NoopCount - r.FailedCount
+	if r.NotAttemptedCount < 0 {
+		r.NotAttemptedCount = 0
+	}
+	r.SummaryBasename = ""
+	if summaryPath != "" {
+		name := filepath.Base(summaryPath)
+		if screenSummaryBasenamePattern.MatchString(name) {
+			r.SummaryBasename = name
+		}
+	}
+}
+
+func runAutomaticCore(args []string, readCredential app.CredentialReader, newClient app.ClientFactory, startup startupPass, terminal *fullScreenResult) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to local JSON configuration")
 	manualOnly := fs.Bool("manual-only", false, "refresh only accounts marked manual_only/skipped in today's completed 04:00 native run")
@@ -509,6 +650,13 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 	previewOnly := fs.Bool("preview-only", false, "with --full-screen, generate reports/plans without applying model mappings")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	humanOutput := io.Writer(os.Stdout)
+	if *fullScreen {
+		humanOutput = os.Stderr
+		if terminal != nil {
+			terminal.set("failed", "configuration_invalid", nil, app.ApplyResult{}, "")
+		}
 	}
 	if *configPath == "" || fs.NArg() != 0 {
 		return errors.New("run requires --config <path>")
@@ -536,6 +684,9 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 				return hashErr
 			}
 			if cfg.ApplyModeValue() != "approved_rules" || cfg.ApprovedRulesSHA256 == "" || cfg.ApprovedRulesSHA256 != rulesHash {
+				if terminal != nil {
+					terminal.set("blocked", "approved_rules_blocked", nil, app.ApplyResult{}, "")
+				}
 				return errors.New("run --full-screen blocked before credentials/API access: automatic apply requires an exact approved rules hash")
 			}
 		}
@@ -551,6 +702,9 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 	prepared, err := discoverer.Preflight(cfg)
 	if err != nil {
 		return err
+	}
+	if terminal != nil {
+		terminal.set("failed", "discovery_failed", nil, app.ApplyResult{}, "")
 	}
 	if err := prepareOutputDirectory(cfg.StateDir); err != nil {
 		return err
@@ -568,7 +722,21 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 	}
 	result, err := discoverer.DiscoverPrepared(ctx, cfg, prepared)
 	if err != nil {
+		if terminal != nil {
+			var gate interface{ ReasonCode() string }
+			switch {
+			case errors.As(err, &gate):
+				terminal.set("blocked", gate.ReasonCode(), nil, app.ApplyResult{}, "")
+			case isManagerLockReviewError(err):
+				terminal.set("blocked", "manager_lock_requires_review", nil, app.ApplyResult{}, "")
+			case strings.Contains(err.Error(), "administrator credential could not be read"):
+				terminal.set("failed", "credential_unavailable", nil, app.ApplyResult{}, "")
+			}
+		}
 		return err
+	}
+	if terminal != nil {
+		terminal.set("failed", "discovery_failed", result.Plan, app.ApplyResult{}, "")
 	}
 	reportPath, err := report.Write(cfg.ReportDir, result.Report)
 	if err != nil {
@@ -576,7 +744,7 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 	}
 	if result.Plan == nil {
 		if !*fullScreen {
-			fmt.Printf("run complete: manual_only=%t full_screen=false preview_only=%t; no applicable plan; account_scan_status=%s accounts=%d report=%s\n", *manualOnly, *previewOnly, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath)
+			fmt.Fprintf(humanOutput, "run complete: manual_only=%t full_screen=false preview_only=%t; no applicable plan; account_scan_status=%s accounts=%d report=%s\n", *manualOnly, *previewOnly, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath)
 			return nil
 		}
 		status := report.ScreenSummaryNoPlan
@@ -587,8 +755,16 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 		if summaryErr != nil {
 			return summaryErr
 		}
-		fmt.Printf("run complete: status=%s manual_only=%t full_screen=%t preview_only=%t; no applicable plan; account_scan_status=%s accounts=%d report=%s summary=%s\n", status, *manualOnly, *fullScreen, *previewOnly, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath, summaryPath)
-		fmt.Printf("summary_path_json=%s\n", summaryJSON)
+		if result.Report.AccountScanStatus == "partial" {
+			terminal.set("partial", "account_scan_partial", nil, app.ApplyResult{}, summaryPath)
+		} else {
+			terminal.set("no_plan", "no_applicable_plan", nil, app.ApplyResult{}, summaryPath)
+		}
+		fmt.Fprintf(humanOutput, "run complete: status=%s manual_only=%t full_screen=%t preview_only=%t; no applicable plan; account_scan_status=%s accounts=%d report=%s summary=%s\n", status, *manualOnly, *fullScreen, *previewOnly, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath, summaryPath)
+		fmt.Fprintf(humanOutput, "summary_path_json=%s\n", summaryJSON)
+		if result.Report.AccountScanStatus == "partial" {
+			return errors.New("full-screen account scan was incomplete")
+		}
 		return nil
 	}
 	if *previewOnly {
@@ -596,9 +772,10 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 		if summaryErr != nil {
 			return summaryErr
 		}
-		fmt.Printf("run complete: status=%s full_screen=true preview_only=true; no model mappings applied; account_scan_status=%s accounts=%d report=%s plan=%s plan_sha256=%s summary=%s\n", report.ScreenSummaryPreview, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath, result.PlanPath, result.PlanSHA256, summaryPath)
-		fmt.Printf("summary_path_json=%s\n", summaryJSON)
-		return nil
+		terminal.set("failed", "configuration_invalid", result.Plan, app.ApplyResult{}, summaryPath)
+		fmt.Fprintf(humanOutput, "run complete: status=%s full_screen=true preview_only=true; no model mappings applied; account_scan_status=%s accounts=%d report=%s plan=%s plan_sha256=%s summary=%s\n", report.ScreenSummaryPreview, result.Report.AccountScanStatus, len(result.Report.Discovery), reportPath, result.PlanPath, result.PlanSHA256, summaryPath)
+		fmt.Fprintf(humanOutput, "summary_path_json=%s\n", summaryJSON)
+		return errors.New("full-screen preview-only mode did not apply mappings")
 	}
 	_, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
 	if err != nil {
@@ -606,39 +783,59 @@ func runAutomaticPreparedWithStartup(args []string, readCredential app.Credentia
 	}
 	if cfg.ApplyModeValue() != "approved_rules" || cfg.ApprovedRulesSHA256 == "" || cfg.ApprovedRulesSHA256 != rulesHash {
 		if !*fullScreen {
-			fmt.Printf("run complete: manual_only=%t preview only; approved rules hash is absent or mismatched; report=%s plan=%s plan_sha256=%s\n", *manualOnly, reportPath, result.PlanPath, result.PlanSHA256)
+			fmt.Fprintf(humanOutput, "run complete: manual_only=%t preview only; approved rules hash is absent or mismatched; report=%s plan=%s plan_sha256=%s\n", *manualOnly, reportPath, result.PlanPath, result.PlanSHA256)
 			return nil
 		}
 		summaryPath, summaryJSON, summaryErr := writeScreenSummary(cfg.ReportDir, result.Report, result.Plan, report.ScreenSummaryOutcome{Status: report.ScreenSummaryBlockedAfterDiscovery, PlanSHA256: result.PlanSHA256, ReportPath: reportPath, PlanPath: result.PlanPath})
 		if summaryErr != nil {
 			return summaryErr
 		}
-		fmt.Printf("run complete: status=%s; approved rules changed after discovery or no longer match; mapping apply was blocked; report=%s plan=%s plan_sha256=%s summary=%s\n", report.ScreenSummaryBlockedAfterDiscovery, reportPath, result.PlanPath, result.PlanSHA256, summaryPath)
-		fmt.Printf("summary_path_json=%s\n", summaryJSON)
-		return nil
+		terminal.set("blocked", "approved_rules_blocked", result.Plan, app.ApplyResult{}, summaryPath)
+		fmt.Fprintf(humanOutput, "run complete: status=%s; approved rules changed after discovery or no longer match; mapping apply was blocked; report=%s plan=%s plan_sha256=%s summary=%s\n", report.ScreenSummaryBlockedAfterDiscovery, reportPath, result.PlanPath, result.PlanSHA256, summaryPath)
+		fmt.Fprintf(humanOutput, "summary_path_json=%s\n", summaryJSON)
+		return errors.New("approved rules changed after full-screen discovery; mapping apply was blocked")
+	}
+	if terminal != nil {
+		terminal.set("failed", "apply_failed", result.Plan, app.ApplyResult{}, "")
 	}
 	applier := app.Applier{ReadCredential: readCredential, NewClient: newClient, ManualOnlyOnly: *manualOnly, FullScreen: *fullScreen, LifecycleStartup: lifecycleStartup}
 	applyPrepared, err := applier.Preflight(cfg, *result.Plan, result.PlanSHA256, "", true)
 	if err != nil {
+		if terminal != nil {
+			status, reason := fullScreenApplyFailure(err, app.ApplyResult{})
+			terminal.set(status, reason, result.Plan, app.ApplyResult{}, "")
+		}
 		return err
 	}
 	applyResult, err := applier.ApplyPrepared(ctx, cfg, *result.Plan, result.PlanSHA256, "", true, applyPrepared)
 	if err != nil {
 		if *fullScreen {
+			if terminal != nil {
+				status, reason := fullScreenApplyFailure(err, applyResult)
+				terminal.set(status, reason, result.Plan, applyResult, "")
+			}
 			return fullScreenApplyError(applyResult, reportPath, result.PlanPath, err)
 		}
 		return fmt.Errorf("run stopped (%s): %w", applyResult.String(), err)
 	}
 	if !*fullScreen {
-		fmt.Printf("run complete: manual_only=%t full_screen=false %s report=%s plan=%s\n", *manualOnly, applyResult.String(), reportPath, result.PlanPath)
+		fmt.Fprintf(humanOutput, "run complete: manual_only=%t full_screen=false %s report=%s plan=%s\n", *manualOnly, applyResult.String(), reportPath, result.PlanPath)
 		return nil
 	}
 	summaryPath, summaryJSON, summaryErr := writeScreenSummary(cfg.ReportDir, result.Report, result.Plan, report.ScreenSummaryOutcome{Status: report.ScreenSummaryApplied, AppliedIDs: applyResult.AppliedIDs, NoopIDs: applyResult.NoopIDs, Consumed: applyResult.Consumed, PlanSHA256: result.PlanSHA256, ReportPath: reportPath, PlanPath: result.PlanPath})
 	if summaryErr != nil {
+		if terminal != nil {
+			status, reason := "failed", "apply_failed"
+			if len(applyResult.AppliedIDs) > 0 {
+				status, reason = "partial", "apply_partial"
+			}
+			terminal.set(status, reason, result.Plan, applyResult, "")
+		}
 		return fmt.Errorf("mapping apply completed (%s applied_ids=%v no_op_ids=%v), but the local summary could not be written; do not blindly rerun: %w", applyResult.String(), sortedAccountIDs(applyResult.AppliedIDs), sortedAccountIDs(applyResult.NoopIDs), summaryErr)
 	}
-	fmt.Printf("run complete: status=%s manual_only=%t full_screen=%t %s report=%s plan=%s summary=%s\n", report.ScreenSummaryApplied, *manualOnly, *fullScreen, applyResult.String(), reportPath, result.PlanPath, summaryPath)
-	fmt.Printf("summary_path_json=%s\n", summaryJSON)
+	terminal.set("succeeded", "completed", result.Plan, applyResult, summaryPath)
+	fmt.Fprintf(humanOutput, "run complete: status=%s manual_only=%t full_screen=%t %s report=%s plan=%s summary=%s\n", report.ScreenSummaryApplied, *manualOnly, *fullScreen, applyResult.String(), reportPath, result.PlanPath, summaryPath)
+	fmt.Fprintf(humanOutput, "summary_path_json=%s\n", summaryJSON)
 	return nil
 }
 

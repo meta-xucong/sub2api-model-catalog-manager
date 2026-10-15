@@ -60,6 +60,53 @@ type Discoverer struct {
 	LifecycleStartup     officialcatalog.StartupSyncResult
 }
 
+// NativeRefreshGateError is a deliberately small, secret-free classification
+// for a best-effort check of Sub2API's native model-catalog refresh state.
+// ReasonCode returns only one of the fixed values consumed by the license
+// admin runner.
+type NativeRefreshGateError struct {
+	code string
+}
+
+func (e *NativeRefreshGateError) Error() string {
+	if e == nil {
+		return "native refresh state is unavailable"
+	}
+	return "native refresh gate blocked: " + e.code
+}
+
+func (e *NativeRefreshGateError) ReasonCode() string {
+	if e == nil {
+		return "native_refresh_status_unknown"
+	}
+	return e.code
+}
+
+// CheckNativeRefreshGate returns only for a known non-running native refresh
+// status. It does not claim an atomic lock: a refresh can start immediately
+// after this read.
+func CheckNativeRefreshGate(ctx context.Context, client AdminAPI) (adminapi.RefreshStatus, error) {
+	status, err := client.RefreshStatus(ctx)
+	if err != nil {
+		return adminapi.RefreshStatus{}, &NativeRefreshGateError{code: "native_refresh_status_unavailable"}
+	}
+	if status.RunStatus == "running" || status.RunStatus == "stale_running" {
+		return status, &NativeRefreshGateError{code: "native_refresh_running"}
+	}
+	if status.RunStatus == "unavailable" {
+		return status, &NativeRefreshGateError{code: "native_refresh_status_unavailable"}
+	}
+	if !status.Enabled {
+		return status, &NativeRefreshGateError{code: "native_refresh_status_unknown"}
+	}
+	switch status.RunStatus {
+	case "completed", "succeeded", "partial_failure", "never_run":
+		return status, nil
+	default:
+		return status, &NativeRefreshGateError{code: "native_refresh_status_unknown"}
+	}
+}
+
 var safeWarningCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)
 
 const (
@@ -195,7 +242,12 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		return result, err
 	}
 	var status adminapi.RefreshStatus
-	if !d.FullScreen {
+	if d.FullScreen {
+		status, err = CheckNativeRefreshGate(ctx, client)
+		if err != nil {
+			return result, err
+		}
+	} else {
 		status, err = client.RefreshStatus(ctx)
 		if err != nil {
 			return result, err

@@ -33,6 +33,9 @@ type ApplyResult struct {
 	AppliedIDs []int64
 	NoopIDs    []int64
 	Consumed   bool
+	// FailedID is internal accounting for the one account whose mapping write
+	// request was entered but not accepted by response plus readback.
+	FailedID int64
 }
 
 // ApplyPreflight is the exact local rules/state snapshot validated before any
@@ -401,6 +404,12 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		if immediate.Status != "active" || immediate.ParentAccountID != nil || !sameAccountSource(item.beforeAccount, immediate) || !reflect.DeepEqual(immediate.ModelMapping, p.Before) {
 			return result, errors.New("apply stopped: account source or complete mapping drifted immediately before mapping update")
 		}
+		if a.FullScreen {
+			if _, gateErr := CheckNativeRefreshGate(ctx, client); gateErr != nil {
+				return result, gateErr
+			}
+		}
+		result.FailedID = p.AccountID
 		response, writeErr := client.BulkUpdateMapping(ctx, p.AccountID, p.After)
 		if errors.Is(writeErr, adminapi.ErrUnexpectedBulkResult) {
 			return result, errors.New("apply stopped: bulk-update returned failed or unexpected account IDs; no retry was sent")
@@ -424,6 +433,7 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		// The remote mapping is now verified even if the local ownership-state
 		// save below fails. Preserve that partial-success evidence in the result.
 		result.AppliedIDs = append(result.AppliedIDs, p.AccountID)
+		result.FailedID = 0
 		applyManagedChanges(&localState, p)
 		if err := state.Save(statePath, localState); err != nil {
 			return result, errors.New("mapping was verified, but local ownership state could not be saved; plan remains consumed")

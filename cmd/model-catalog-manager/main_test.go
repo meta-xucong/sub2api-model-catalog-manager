@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -540,14 +542,21 @@ func TestAutomaticRunMatchingRawRulesHashAppliesOnlyReviewedDelta(t *testing.T) 
 	}
 }
 
-func TestFullScreenRunAppliesApprovedRuleWithoutDailyRefreshStatus(t *testing.T) {
+func TestFullScreenRunAppliesApprovedRuleWithStructuredTerminalResult(t *testing.T) {
 	configPath, api := fullScreenFixture(t, false)
 	api.status.RunStatus = "partial_failure"
-	if err := runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil }); err != nil {
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if api.syncCalls != 1 || api.bulkCalls != 1 || api.statusCalls != 0 || api.lastBulkID != 9001 || api.lastMapping["canonical-name"] != "upstream-known" {
+	if api.syncCalls != 1 || api.bulkCalls != 1 || api.statusCalls != 2 || api.lastBulkID != 9001 || api.lastMapping["canonical-name"] != "upstream-known" {
 		t.Fatalf("full-screen did not sync/apply under its own catalog pass: sync=%d bulk=%d status=%d id=%d mapping=%v", api.syncCalls, api.bulkCalls, api.statusCalls, api.lastBulkID, api.lastMapping)
+	}
+	var terminal fullScreenResult
+	if !strings.HasSuffix(stdout, "\n") || strings.Count(strings.TrimSuffix(stdout, "\n"), "\n") != 0 || json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "succeeded" || terminal.ReasonCode != "completed" || terminal.PlannedCount != 1 || terminal.AppliedCount != 1 || terminal.NoopCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 0 || !screenSummaryBasenamePattern.MatchString(terminal.SummaryBasename) {
+		t.Fatalf("full-screen stdout did not contain exactly one valid terminal result: %q decoded=%#v", stdout, terminal)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -563,6 +572,75 @@ func TestFullScreenRunAppliesApprovedRuleWithoutDailyRefreshStatus(t *testing.T)
 	}
 	if !strings.Contains(string(summaryBytes), "已应用") || !strings.Contains(string(summaryBytes), "`canonical-name` → `upstream-known`") || !strings.Contains(string(summaryBytes), "write_readback_verified") {
 		t.Fatalf("successful full-screen summary is missing verified resulting mapping:\n%s", string(summaryBytes))
+	}
+}
+
+func TestRequestsFullScreenFollowsGoBooleanFlagSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		arg  string
+		want bool
+	}{
+		{arg: "--full-screen", want: true},
+		{arg: "-full-screen", want: true},
+		{arg: "--full-screen=true", want: true},
+		{arg: "-full-screen=1", want: true},
+		{arg: "--full-screen=T", want: true},
+		{arg: "--full-screen=TRUE", want: true},
+		{arg: "--full-screen=false", want: false},
+		{arg: "-full-screen=0", want: false},
+		{arg: "--full-screen=not-a-bool", want: false},
+		{arg: "--", want: false},
+	} {
+		t.Run(tc.arg, func(t *testing.T) {
+			if got := requestsFullScreen([]string{tc.arg}); got != tc.want {
+				t.Fatalf("requestsFullScreen(%q)=%t, want %t", tc.arg, got, tc.want)
+			}
+		})
+	}
+	if requestsFullScreen([]string{"--", "--full-screen"}) {
+		t.Fatal("full-screen flag after -- must be treated as positional input")
+	}
+	if !requestsFullScreen([]string{"--full-screen=false", "--full-screen"}) {
+		t.Fatal("last full-screen=true flag should win after false")
+	}
+	if requestsFullScreen([]string{"--full-screen", "--full-screen=false"}) {
+		t.Fatal("last full-screen=false flag should win after true")
+	}
+	if enabled, invalid := fullScreenFlagState([]string{"--full-screen=TRUE"}); !enabled || invalid {
+		t.Fatal("Go bool alias TRUE should enable full-screen without a parse error")
+	}
+	if _, invalid := fullScreenFlagState([]string{"--full-screen=bad"}); !invalid {
+		t.Fatal("invalid bool value must be distinguished from an ordinary false flag")
+	}
+}
+
+func TestFullScreenFalseKeepsOrdinaryOutputAndRefreshBehavior(t *testing.T) {
+	configPath, api, _ := automaticFixture(t, "")
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen=true", "--full-screen=false"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
+	if err != nil {
+		t.Fatalf("ordinary run with --full-screen=false failed: %v", err)
+	}
+	if stdout == "" || strings.HasPrefix(strings.TrimSpace(stdout), "{") || strings.Contains(stdout, `"schema_version"`) || !strings.Contains(stdout, "run complete: manual_only=false full_screen=false") {
+		t.Fatalf("--full-screen=false did not retain ordinary CLI output: %q", stdout)
+	}
+	if api.statusCalls != 1 || api.syncCalls != 1 || api.bulkCalls != 1 {
+		t.Fatalf("ordinary refresh/discovery behavior changed: status=%d sync=%d writes=%d", api.statusCalls, api.syncCalls, api.bulkCalls)
+	}
+}
+
+func TestInvalidFullScreenBooleanEmitsConfigurationInvalidWithoutRunning(t *testing.T) {
+	configPath, api := fullScreenFixture(t, false)
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen=invalid"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
+	if err == nil {
+		t.Fatal("invalid boolean flag unexpectedly ran successfully")
+	}
+	var terminal fullScreenResult
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "failed" || terminal.ReasonCode != "configuration_invalid" || api.statusCalls != 0 || api.syncCalls != 0 || api.bulkCalls != 0 {
+		t.Fatalf("invalid full-screen bool did not fail structurally before external work: stdout=%q terminal=%#v status=%d sync=%d writes=%d", stdout, terminal, api.statusCalls, api.syncCalls, api.bulkCalls)
 	}
 }
 
@@ -582,9 +660,11 @@ func TestFullScreenRulesHashDriftAfterDiscoveryBlocksApplyAndWritesBlockedSummar
 			t.Errorf("change mock rules after discovery started: %v", writeErr)
 		}
 	}
-	err = runAutomaticPreparedWithStartup([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil }, nil)
-	if err != nil {
-		t.Fatal(err)
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticPreparedWithStartup([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil }, nil)
+	})
+	if err == nil {
+		t.Fatal("blocked full-screen run returned a successful exit status")
 	}
 	if api.syncCalls != 1 || api.bulkCalls != 0 {
 		t.Fatalf("rules drift after discovery did not fail closed: sync=%d bulk=%d", api.syncCalls, api.bulkCalls)
@@ -600,6 +680,10 @@ func TestFullScreenRulesHashDriftAfterDiscoveryBlocksApplyAndWritesBlockedSummar
 	summary := string(summaryBytes)
 	if !strings.Contains(summary, "BLOCKED AFTER DISCOVERY / 未应用映射") || !strings.Contains(summary, "`manual` → `keep`") || strings.Contains(summary, "PREVIEW ONLY") {
 		t.Fatalf("rules drift summary did not distinguish current mapping from explicit preview:\n%s", summary)
+	}
+	var terminal fullScreenResult
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "blocked" || terminal.ReasonCode != "approved_rules_blocked" || terminal.PlannedCount != 1 || terminal.NotAttemptedCount != 1 || terminal.AppliedCount != 0 || terminal.FailedCount != 0 {
+		t.Fatalf("blocked full-screen result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
 	}
 }
 
@@ -618,9 +702,15 @@ func TestFullScreenApplyErrorIncludesVerifiedIDsAndArtifactPaths(t *testing.T) {
 func TestFullScreenApplyFailureDoesNotWriteSuccessSummary(t *testing.T) {
 	configPath, api := fullScreenFixture(t, false)
 	api.bulkErr = adminapi.ErrUnexpectedBulkResult
-	err := runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
 	if err == nil {
 		t.Fatal("full-screen apply failure was reported as success")
+	}
+	var terminal fullScreenResult
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "failed" || terminal.ReasonCode != "apply_failed" || terminal.PlannedCount != 1 || terminal.AppliedCount != 0 || terminal.NoopCount != 0 || terminal.FailedCount != 1 || terminal.NotAttemptedCount != 0 || terminal.SummaryBasename != "" {
+		t.Fatalf("failed apply result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
 	}
 	for _, want := range []string{"apply may have partially succeeded", "applied_ids=[]", "report=", "plan=", "do not blindly rerun"} {
 		if !strings.Contains(err.Error(), want) {
@@ -660,12 +750,169 @@ func TestFullScreenAutomaticHashMismatchStopsBeforeCredentialOrAPI(t *testing.T)
 
 func TestFullScreenPreviewOnlyDoesNotApplyEvenWithMatchingApproval(t *testing.T) {
 	configPath, api := fullScreenFixture(t, false)
-	if err := runAutomaticWith([]string{"--config", configPath, "--full-screen", "--preview-only"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil }); err != nil {
-		t.Fatal(err)
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen", "--preview-only"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
+	if err == nil {
+		t.Fatal("preview-only full-screen result should not report success")
 	}
-	if api.syncCalls != 1 || api.bulkCalls != 0 || api.statusCalls != 0 {
+	if api.syncCalls != 1 || api.bulkCalls != 0 || api.statusCalls != 1 {
 		t.Fatalf("preview-only full screen crossed the mapping-write boundary: sync=%d bulk=%d status=%d", api.syncCalls, api.bulkCalls, api.statusCalls)
 	}
+	var terminal fullScreenResult
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "failed" || terminal.ReasonCode != "configuration_invalid" || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
+		t.Fatalf("preview-only full-screen result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
+	}
+}
+
+func TestFullScreenNativeRefreshGateProducesBlockedTerminalResult(t *testing.T) {
+	configPath, api := fullScreenFixture(t, false)
+	api.status.RunStatus = "running"
+	stdout, err := captureStdout(t, func() error {
+		return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+	})
+	if err == nil || api.syncCalls != 0 || api.bulkCalls != 0 || api.statusCalls != 1 {
+		t.Fatalf("running native refresh was not blocked before discovery: err=%v sync=%d writes=%d status=%d", err, api.syncCalls, api.bulkCalls, api.statusCalls)
+	}
+	var terminal fullScreenResult
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "blocked" || terminal.ReasonCode != "native_refresh_running" || terminal.PlannedCount != 0 || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 0 {
+		t.Fatalf("native refresh block result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
+	}
+}
+
+func TestFullScreenApplyFailureMapsManagerLockToBlockedOrPartial(t *testing.T) {
+	lockErr := errors.New("another run may be active or a prior lock needs manual review")
+	for _, tc := range []struct {
+		name       string
+		result     app.ApplyResult
+		wantStatus string
+		wantReason string
+	}{
+		{name: "no verified writes", wantStatus: "blocked", wantReason: "manager_lock_requires_review"},
+		{name: "prior verified write", result: app.ApplyResult{AppliedIDs: []int64{9001}}, wantStatus: "partial", wantReason: "apply_partial"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, reason := fullScreenApplyFailure(lockErr, tc.result)
+			if status != tc.wantStatus || reason != tc.wantReason {
+				t.Fatalf("manager lock terminal=%s/%s, want %s/%s", status, reason, tc.wantStatus, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestFullScreenPartialAfterVerifiedWritePreservesNativeRefreshGateReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     adminapi.RefreshStatus
+		wantReason string
+	}{
+		{name: "running", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "running"}, wantReason: "native_refresh_running"},
+		{name: "unknown", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "future_status"}, wantReason: "native_refresh_status_unknown"},
+		{name: "unavailable", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "unavailable"}, wantReason: "native_refresh_status_unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath, api := fullScreenFixture(t, false)
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules, err := catalog.LoadRules(cfg.RulesFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules.SourceProfiles[0].Source.AccountID = 0
+			rules.Aliases[0].Source.AccountID = 0
+			rulesBytes, err := json.MarshalIndent(rules, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cfg.RulesFile, rulesBytes, 0600); err != nil {
+				t.Fatal(err)
+			}
+			rulesHash := sha256.Sum256(rulesBytes)
+			cfg.ApprovedRulesSHA256 = hex.EncodeToString(rulesHash[:])
+			configBytes, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, configBytes, 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			account1 := api.account
+			account2 := account1
+			account2.ID = 9002
+			api.accounts = map[int64]adminapi.Account{account1.ID: account1, account2.ID: account2}
+			api.catalogs = map[int64]adminapi.Catalog{
+				account1.ID: api.catalog,
+				account2.ID: api.catalog,
+			}
+			api.afterBulk = func(int64) { api.status = tc.status }
+			stdout, runErr := captureStdout(t, func() error {
+				return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+			})
+			if runErr == nil {
+				t.Fatal("partial full-screen result returned a successful exit status")
+			}
+			if api.syncCalls != 2 || api.bulkCalls != 1 || api.statusCalls != 3 {
+				t.Fatalf("test did not verify one mapping write followed by a refresh gate: sync=%d writes=%d status=%d", api.syncCalls, api.bulkCalls, api.statusCalls)
+			}
+			var terminal fullScreenResult
+			if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "partial" || terminal.ReasonCode != tc.wantReason || terminal.PlannedCount != 2 || terminal.AppliedCount != 1 || terminal.NoopCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
+				t.Fatalf("partial result after verified write lost its native refresh reason or counts: stdout=%q result=%#v", stdout, terminal)
+			}
+		})
+	}
+}
+
+func TestFullScreenNoPlanAndPartialScanHaveDistinctTerminalResults(t *testing.T) {
+	t.Run("complete no plan", func(t *testing.T) {
+		configPath, api := fullScreenFixture(t, false)
+		api.catalog = adminapi.Catalog{Models: []string{}, LiveListAvailable: false}
+		stdout, err := captureStdout(t, func() error {
+			return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+		})
+		if err != nil {
+			t.Fatalf("complete no-plan run should exit successfully: %v", err)
+		}
+		var terminal fullScreenResult
+		if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "no_plan" || terminal.ReasonCode != "no_applicable_plan" || terminal.PlannedCount != 0 || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 0 {
+			t.Fatalf("complete no-plan result is inconsistent: stdout=%q result=%#v", stdout, terminal)
+		}
+	})
+	t.Run("partial account detail scan", func(t *testing.T) {
+		configPath, api := fullScreenFixture(t, false)
+		api.accountErr = errors.New("synthetic account read failure")
+		stdout, err := captureStdout(t, func() error {
+			return runAutomaticWith([]string{"--config", configPath, "--full-screen"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
+		})
+		if err == nil {
+			t.Fatal("partial account scan must not return a successful exit status")
+		}
+		var terminal fullScreenResult
+		if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "partial" || terminal.ReasonCode != "account_scan_partial" || terminal.PlannedCount != 0 || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 0 || terminal.SummaryBasename == "" {
+			t.Fatalf("partial account scan result is inconsistent: stdout=%q result=%#v", stdout, terminal)
+		}
+	})
+}
+
+func captureStdout(t *testing.T, run func() error) (string, error) {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	os.Stdout = writer
+	runErr := run()
+	_ = writer.Close()
+	os.Stdout = previous
+	data, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(data), runErr
 }
 
 func TestFullScreenConfigRequiresFlagAndRejectsConflictingFlagsBeforeAccess(t *testing.T) {
@@ -815,9 +1062,13 @@ func mockCredentialReader(config.CredentialConfig) (securecred.Value, error) {
 
 type mainWorkflowAPI struct {
 	account     adminapi.Account
+	accountErr  error
+	accounts    map[int64]adminapi.Account
 	status      adminapi.RefreshStatus
 	catalog     adminapi.Catalog
+	catalogs    map[int64]adminapi.Catalog
 	afterSync   func()
+	afterBulk   func(int64)
 	bulkErr     error
 	syncCalls   int
 	bulkCalls   int
@@ -832,26 +1083,57 @@ func (m *mainWorkflowAPI) RefreshStatus(context.Context) (adminapi.RefreshStatus
 	return m.status, nil
 }
 func (m *mainWorkflowAPI) ListAllAccounts(context.Context) ([]adminapi.AccountSummary, error) {
+	if m.accounts != nil {
+		ids := make([]int64, 0, len(m.accounts))
+		for id := range m.accounts {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		rows := make([]adminapi.AccountSummary, 0, len(ids))
+		for _, id := range ids {
+			account := m.accounts[id]
+			rows = append(rows, adminapi.AccountSummary{ID: id, Platform: account.Platform, Type: account.Type, Status: account.Status, ParentAccountID: account.ParentAccountID})
+		}
+		return rows, nil
+	}
 	return []adminapi.AccountSummary{{ID: m.account.ID, Platform: m.account.Platform, Type: m.account.Type, Status: m.account.Status, ParentAccountID: m.account.ParentAccountID}}, nil
 }
 func (m *mainWorkflowAPI) Account(_ context.Context, id int64) (adminapi.Account, error) {
-	if id != m.account.ID {
+	if m.accountErr != nil {
+		return adminapi.Account{}, m.accountErr
+	}
+	account, ok := m.account, id == m.account.ID
+	if m.accounts != nil {
+		account, ok = m.accounts[id]
+	}
+	if !ok {
 		return adminapi.Account{}, errors.New("unexpected mock account id")
 	}
-	copy := m.account
-	copy.ModelMapping = make(map[string]string, len(m.account.ModelMapping))
-	for key, value := range m.account.ModelMapping {
+	copy := account
+	copy.ModelMapping = make(map[string]string, len(account.ModelMapping))
+	for key, value := range account.ModelMapping {
 		copy.ModelMapping[key] = value
 	}
 	return copy, nil
 }
 func (m *mainWorkflowAPI) SyncUpstream(_ context.Context, id int64) (adminapi.Catalog, error) {
-	if id != m.account.ID {
+	if m.accounts != nil {
+		if _, ok := m.accounts[id]; !ok {
+			return adminapi.Catalog{}, errors.New("unexpected sync id")
+		}
+	} else if id != m.account.ID {
 		return adminapi.Catalog{}, errors.New("unexpected sync id")
 	}
 	m.syncCalls++
 	if m.afterSync != nil {
 		m.afterSync()
+	}
+	if m.catalogs != nil {
+		catalog, ok := m.catalogs[id]
+		if !ok {
+			return adminapi.Catalog{}, errors.New("unexpected sync catalog id")
+		}
+		return catalog, nil
 	}
 	return m.catalog, nil
 }
@@ -865,7 +1147,19 @@ func (m *mainWorkflowAPI) BulkUpdateMapping(_ context.Context, id int64, mapping
 	for key, value := range mapping {
 		m.lastMapping[key] = value
 	}
-	m.account.ModelMapping = m.lastMapping
+	if m.accounts != nil {
+		account, ok := m.accounts[id]
+		if !ok {
+			return adminapi.BulkUpdateResult{}, errors.New("unexpected bulk-update id")
+		}
+		account.ModelMapping = m.lastMapping
+		m.accounts[id] = account
+	} else {
+		m.account.ModelMapping = m.lastMapping
+	}
+	if m.afterBulk != nil {
+		m.afterBulk(id)
+	}
 	return adminapi.BulkUpdateResult{SuccessIDs: []int64{id}, FailedIDs: []int64{}}, nil
 }
 func (m *mainWorkflowAPI) Close() {}

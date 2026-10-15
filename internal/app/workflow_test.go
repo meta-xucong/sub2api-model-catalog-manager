@@ -1284,7 +1284,7 @@ func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
 	}
 }
 
-func TestFullScreenSyncsAndAppliesEligibleAccountsWithoutDailyRefreshStatus(t *testing.T) {
+func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(t *testing.T) {
 	cfg, selected, now := testWorkflowConfig(t, true, true)
 	cfg.AccountScope = "all"
 	cfg.Accounts = nil
@@ -1297,7 +1297,7 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsWithoutDailyRefreshStatus(t *t
 	rules := workflowRules(selected)
 	rules.Aliases = []catalog.AliasRule{}
 	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
-	rules.SourceProfiles[0].IdentityAddPolicy = "report_only"
+	rules.SourceProfiles[0].IdentityAddPolicy = "add_exact"
 	rules.SourceProfiles[0].IdentityCatalogPolicy = "replace_identity_from_live_list"
 	writeWorkflowRules(t, cfg.RulesFile, rules)
 	_, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
@@ -1329,8 +1329,8 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsWithoutDailyRefreshStatus(t *t
 	if !discovery.Report.FullAccountScreen || discovery.Report.AccountScanStatus != "complete" || discovery.Report.AccountInventoryCount != 5 || len(discovery.Report.Discovery) != 5 {
 		t.Fatalf("full-screen run did not cover the complete inventory: %#v", discovery.Report)
 	}
-	if hasCall(api.calls, "status") || api.syncCalls != 1 || !hasCall(api.calls, "sync:7") || hasCall(api.calls, "sync:8") || hasCall(api.calls, "sync:9") || hasCall(api.calls, "sync:10") || hasCall(api.calls, "sync:11") {
-		t.Fatalf("full-screen mode consulted daily status or synced ineligible accounts: calls=%v sync=%d", api.calls, api.syncCalls)
+	if countCall(api.calls, "status") != 1 || api.syncCalls != 1 || !hasCall(api.calls, "sync:7") || hasCall(api.calls, "sync:8") || hasCall(api.calls, "sync:9") || hasCall(api.calls, "sync:10") || hasCall(api.calls, "sync:11") {
+		t.Fatalf("full-screen mode did not check native refresh once before discovery or synced ineligible accounts: calls=%v sync=%d", api.calls, api.syncCalls)
 	}
 	statuses := map[int64]string{}
 	discoveryRows := map[int64]report.DiscoveryAccount{}
@@ -1364,8 +1364,124 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsWithoutDailyRefreshStatus(t *t
 	if updated["stale-model"] != "" || updated["new-model"] != "new-model" || updated["keep-model"] != "keep-model" {
 		t.Fatalf("approved exact identity sync did not reconcile mapping: %#v", updated)
 	}
-	if api.accounts[unsupported.ID].ModelMapping["manual"] != "preserve" || hasCall(api.calls, "status") {
-		t.Fatal("full-screen changed an unsupported account or consulted daily refresh state")
+	if api.accounts[unsupported.ID].ModelMapping["manual"] != "preserve" || countCall(api.calls, "status") != 2 {
+		t.Fatalf("full-screen changed an unsupported account or failed to check refresh again before write: calls=%v", api.calls)
+	}
+}
+
+func TestNativeRefreshGateAllowsOnlyKnownNonRunningStates(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     adminapi.RefreshStatus
+		statusErr  error
+		wantReason string
+	}{
+		{name: "completed", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "completed"}},
+		{name: "succeeded", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "succeeded"}},
+		{name: "partial failure", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "partial_failure"}},
+		{name: "never run", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "never_run"}},
+		{name: "running", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "running"}, wantReason: "native_refresh_running"},
+		{name: "stale running", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "stale_running"}, wantReason: "native_refresh_running"},
+		{name: "unavailable", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "unavailable"}, wantReason: "native_refresh_status_unavailable"},
+		{name: "empty", status: adminapi.RefreshStatus{Enabled: true}, wantReason: "native_refresh_status_unknown"},
+		{name: "unknown", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "future_status"}, wantReason: "native_refresh_status_unknown"},
+		{name: "disabled", status: adminapi.RefreshStatus{Enabled: false, RunStatus: "completed"}, wantReason: "native_refresh_status_unknown"},
+		{name: "api error", statusErr: errors.New("mock API failure"), wantReason: "native_refresh_status_unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &workflowAPI{status: tc.status, statusErr: tc.statusErr}
+			_, err := CheckNativeRefreshGate(context.Background(), api)
+			if tc.wantReason == "" {
+				if err != nil {
+					t.Fatalf("known non-running status blocked: %v", err)
+				}
+				return
+			}
+			var gate interface{ ReasonCode() string }
+			if !errors.As(err, &gate) || gate.ReasonCode() != tc.wantReason {
+				t.Fatalf("gate error=%v, want reason %s", err, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestFullScreenDiscoveryRefreshGateStopsBeforeAccountDiscovery(t *testing.T) {
+	cfg, _, now := testWorkflowConfig(t, true, true)
+	cfg.AccountScope = "all"
+	cfg.Accounts = nil
+	cfg.AcceptAllCredentialResponseMemoryExposure = true
+	cfg.AllowFullScreenMode = true
+	cfg.Target.RuntimeCompatibility.APIContractID = config.APIContractAllAccountsV1
+	for _, tc := range []struct {
+		name      string
+		status    adminapi.RefreshStatus
+		statusErr error
+	}{
+		{name: "running", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "running"}},
+		{name: "stale", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "stale_running"}},
+		{name: "unavailable", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "unavailable"}},
+		{name: "unknown", status: adminapi.RefreshStatus{Enabled: true, RunStatus: "new_status"}},
+		{name: "empty", status: adminapi.RefreshStatus{Enabled: true}},
+		{name: "API error", statusErr: errors.New("mock API failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &workflowAPI{status: tc.status, statusErr: tc.statusErr}
+			d := Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}
+			_, err := d.Discover(context.Background(), cfg)
+			if err == nil || !hasCall(api.calls, "status") || hasCall(api.calls, "list_accounts") || api.syncCalls != 0 || len(api.bulkCalls) != 0 {
+				t.Fatalf("native refresh gate did not block discovery before account reads/sync: calls=%v err=%v", api.calls, err)
+			}
+		})
+	}
+}
+
+func TestFullScreenApplyRechecksNativeRefreshBeforeEveryMappingWrite(t *testing.T) {
+	cfg, account1, now := testWorkflowConfig(t, true, true)
+	cfg.AccountScope = "all"
+	cfg.Accounts = nil
+	cfg.AcceptAllCredentialResponseMemoryExposure = true
+	cfg.AllowFullScreenMode = true
+	cfg.Target.RuntimeCompatibility.APIContractID = config.APIContractAllAccountsV1
+	cfg.ApplyMode = "approved_rules"
+	account1.ModelMapping = map[string]string{"old": "old"}
+	account2 := account1
+	account2.ID = 8
+	rules := workflowRules(account1)
+	rules.SourceProfiles[0].Source.AccountID = 0
+	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
+	rules.Aliases = []catalog.AliasRule{{Source: rules.SourceProfiles[0].Source, UpstreamID: "new-model", PublicID: "canonical-new", Decision: "approved", Evidence: "exact synthetic test fixture", ReviewedAt: "2026-10-11"}}
+	writeWorkflowRules(t, cfg.RulesFile, rules)
+	_, hash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ApprovedRulesSHA256 = hash
+	api := &workflowAPI{
+		status:   adminapi.RefreshStatus{Enabled: true, RunStatus: "completed"},
+		accounts: map[int64]adminapi.Account{account1.ID: account1, account2.ID: account2},
+		catalogs: map[int64]adminapi.Catalog{
+			account1.ID: {Models: []string{"new-model"}, LiveListAvailable: true},
+			account2.ID: {Models: []string{"new-model"}, LiveListAvailable: true},
+		},
+	}
+	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
+	if err != nil || discovery.Plan == nil || len(discovery.Plan.Accounts) != 2 {
+		t.Fatalf("full-screen setup failed: plan=%#v err=%v", discovery.Plan, err)
+	}
+	api.afterBulk = func(id int64, api *workflowAPI) {
+		if id == account1.ID {
+			api.status.RunStatus = "running"
+		}
+	}
+	applier := workflowApplier(api, now)
+	applier.FullScreen = true
+	result, err := applier.Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, "", true)
+	var gate interface{ ReasonCode() string }
+	if !errors.As(err, &gate) || gate.ReasonCode() != "native_refresh_running" {
+		t.Fatalf("second mapping write was not blocked by newly-running refresh: plan=%#v result=%#v err=%v", discovery.Plan.Accounts, result, err)
+	}
+	if !reflect.DeepEqual(api.bulkCalls, []int64{account1.ID}) || !reflect.DeepEqual(result.AppliedIDs, []int64{account1.ID}) || result.FailedID != 0 || countCall(api.calls, "status") != 3 {
+		t.Fatalf("refresh start was not checked before each mapping write: result=%#v bulk=%v calls=%v", result, api.bulkCalls, api.calls)
 	}
 }
 
@@ -1558,7 +1674,7 @@ func (f *workflowAPI) SetAPIKey([]byte) error {
 
 func (f *workflowAPI) RefreshStatus(context.Context) (adminapi.RefreshStatus, error) {
 	f.calls = append(f.calls, "status")
-	return f.status, nil
+	return f.status, f.statusErr
 }
 
 func (f *workflowAPI) ListAllAccounts(context.Context) ([]adminapi.AccountSummary, error) {
@@ -1641,6 +1757,7 @@ func (f *workflowAPI) Close() {}
 
 type workflowAPI struct {
 	status                   adminapi.RefreshStatus
+	statusErr                error
 	accounts                 map[int64]adminapi.Account
 	inventoryIDs             []int64
 	catalogs                 map[int64]adminapi.Catalog
