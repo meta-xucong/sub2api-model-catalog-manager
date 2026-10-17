@@ -971,10 +971,11 @@ func automaticFixture(t *testing.T, approvedHash string) (string, *mainWorkflowA
 		t.Fatal(err)
 	}
 	rules := catalog.Rules{
-		SchemaVersion:   1,
-		Aliases:         []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "reviewed exact mock rule", ReviewedAt: date}},
-		SourceProfiles:  []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", Evidence: "mock-only build/API scope", ReviewedAt: date}},
-		VersionFamilies: []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
+		SchemaVersion:         1,
+		Aliases:               []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "reviewed exact mock rule", ReviewedAt: date}},
+		SourceProfiles:        []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", OfficialSelectabilityScope: "official-account:test-openai-account", Evidence: "mock-only build/API scope", ReviewedAt: date}},
+		OfficialSelectability: []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "new-model", "canonical-name", "keep", "raw-v2"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "synthetic complete selector fixture"}},
+		VersionFamilies:       []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 	}
 	rulesBytes, err := json.MarshalIndent(rules, "", "  ")
 	if err != nil {
@@ -1184,6 +1185,7 @@ func validApprovalPlan() catalog.ApprovalPlan {
 		Accounts: []catalog.Plan{{
 			AccountID: 9001, Source: source, SourceFingerprint: catalog.SourceFingerprint(source),
 			DirectoryHash: directoryHash, CatalogObservedAt: now, RulesHash: strings.Repeat("c", 64),
+			OfficialSelectabilityScope: "official-account:test-openai-account", OfficialSelectabilitySHA256: strings.Repeat("d", 64), OfficialSelectabilityObservedAt: now.Add(-time.Minute), OfficialSelectabilityExpiresAt: now.Add(23 * time.Hour),
 			LifecycleScopes: []string{}, LifecycleExclusions: []catalog.LifecycleExclusion{}, LifecycleEvidenceSHA256: lifecycleDigest,
 			Completeness: catalog.CompletenessUnknown, LiveListAvailable: true,
 			AbsenceCountsBefore: map[string]int{}, AbsenceCountsAfter: map[string]int{},

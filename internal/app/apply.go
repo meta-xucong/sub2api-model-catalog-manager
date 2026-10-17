@@ -275,29 +275,12 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		if !ok || !sameStringSet(profile.LifecycleScopes, p.LifecycleScopes) {
 			return result, errors.New("apply blocked: source profile no longer matches plan")
 		}
-		lifecycleExclusions := buildLifecycleExclusions(rules, profile.LifecycleScopes, a.LifecycleStartup, now().UTC())
-		blockedLifecycleScopes := make([]string, 0)
-		for _, scope := range profile.LifecycleScopes {
-			if !officialcatalog.LifecycleScopeReady(a.LifecycleStartup, scope, now().UTC()) {
-				blockedLifecycleScopes = append(blockedLifecycleScopes, scope)
-			}
-		}
-		ownerOnlyLifecycleScreen := a.FullScreen && len(blockedLifecycleScopes) > 0 && exactOwnerAvailabilityRules(rules)
 		identityAddPolicy := profile.IdentityAddPolicy
-		if ownerOnlyLifecycleScreen {
-			identityAddPolicy = "report_only"
-		}
 		if identityAddPolicy != p.SourceIdentityAddPolicy {
 			return result, errors.New("apply blocked: source profile identity add policy no longer matches plan")
 		}
-		if len(blockedLifecycleScopes) > 0 && (!a.FullScreen || !ownerOnlyLifecycleDelta(rules, profile.LifecycleScopes, blockedLifecycleScopes, p)) {
-			return result, errors.New("apply blocked: official product lifecycle scope is missing, stale, or invalid")
-		}
-		if profile.IdentityCatalogPolicy != p.IdentityCatalogPolicy && !(ownerOnlyLifecycleScreen && p.IdentityCatalogPolicy == "") {
+		if profile.IdentityCatalogPolicy != p.IdentityCatalogPolicy {
 			return result, errors.New("apply blocked: source profile identity catalog policy no longer matches plan")
-		}
-		if !sameLifecycleExclusions(lifecycleExclusions, p.LifecycleExclusions) {
-			return result, errors.New("apply blocked: official lifecycle evidence changed after discovery")
 		}
 		if !reflect.DeepEqual(account.ModelMapping, p.Before) {
 			return result, errors.New("apply blocked: complete model mapping drifted")
@@ -321,17 +304,14 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		}
 		priorForNormalize := local
 		priorForNormalize.AbsenceCounts = cloneCounterMap(p.AbsenceCountsBefore)
-		normalizationRules := rules
-		if ownerOnlyLifecycleScreen {
-			normalizationRules = ownerOnlyNormalizationRules(rules)
-		}
-		verified, err := catalog.Normalize(normalizationRules, catalog.Input{
+		verified, err := catalog.Normalize(rules, catalog.Input{
 			AccountID: account.ID, Source: source, SourceIdentityAddPolicy: identityAddPolicy,
-			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (a.ManualOnlyOnly || a.FullScreen) && profile.IdentityCatalogPolicy != "" && !ownerOnlyLifecycleScreen,
+			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (a.ManualOnlyOnly || a.FullScreen) && profile.IdentityCatalogPolicy != "",
 			CurrentMapping: account.ModelMapping, ManagedMappings: local.ManagedMappings,
 			LiveModels: p.CatalogModels, LiveListAvailable: p.LiveListAvailable,
 			Completeness: complete, CompletenessProfileID: profileID, DirectoryHash: p.DirectoryHash,
-			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: lifecycleExclusions,
+			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: nil,
+			RequireOfficialSelectability: true, OfficialSelectabilityScope: profile.OfficialSelectabilityScope, Now: now().UTC(),
 		}, priorForNormalize)
 		if err != nil {
 			return result, err
@@ -342,9 +322,6 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		if catalogWarningCodesBlockMappingApply(p.CatalogWarningCodes) {
 			verified.ApplyEligible = false
 			verified.DiscoveryReason = "catalog response contains warnings that may affect the model-ID list"
-		}
-		if len(blockedLifecycleScopes) > 0 && (!a.FullScreen || !ownerOnlyLifecycleDelta(rules, profile.LifecycleScopes, blockedLifecycleScopes, verified)) {
-			return result, errors.New("apply blocked: unavailable official lifecycle scope does not permit this mapping delta")
 		}
 		if !samePlanDelta(verified, p) {
 			return result, errors.New("apply blocked: mapping delta does not match current exact rules and state")
@@ -456,7 +433,7 @@ func snapshotMatches(snapshot *state.CatalogSnapshot, p catalog.Plan) bool {
 }
 
 func samePlanDelta(a, b catalog.Plan) bool {
-	return a.AccountID == b.AccountID && a.SourceFingerprint == b.SourceFingerprint && a.BeforeHash == b.BeforeHash && a.DirectoryHash == b.DirectoryHash && a.RulesHash == b.RulesHash && a.Completeness == b.Completeness && a.LiveListAvailable == b.LiveListAvailable && a.ApplyEligible == b.ApplyEligible && a.SourceIdentityAddPolicy == b.SourceIdentityAddPolicy && a.IdentityCatalogPolicy == b.IdentityCatalogPolicy && a.CompletenessProfileID == b.CompletenessProfileID && sameStringSet(a.LifecycleScopes, b.LifecycleScopes) && a.LifecycleEvidenceSHA256 == b.LifecycleEvidenceSHA256 && sameLifecycleExclusions(a.LifecycleExclusions, b.LifecycleExclusions) && reflect.DeepEqual(a.Before, b.Before) && reflect.DeepEqual(a.After, b.After) && reflect.DeepEqual(a.AbsenceCountsBefore, b.AbsenceCountsBefore) && reflect.DeepEqual(a.AbsenceCountsAfter, b.AbsenceCountsAfter) && reflect.DeepEqual(a.Changes, b.Changes) && reflect.DeepEqual(a.Conflicts, b.Conflicts) && reflect.DeepEqual(a.UnreviewedModels, b.UnreviewedModels) && reflect.DeepEqual(a.CatalogModels, b.CatalogModels) && reflect.DeepEqual(a.CatalogWarningCodes, b.CatalogWarningCodes)
+	return a.AccountID == b.AccountID && a.SourceFingerprint == b.SourceFingerprint && a.BeforeHash == b.BeforeHash && a.DirectoryHash == b.DirectoryHash && a.RulesHash == b.RulesHash && a.Completeness == b.Completeness && a.LiveListAvailable == b.LiveListAvailable && a.ApplyEligible == b.ApplyEligible && a.SourceIdentityAddPolicy == b.SourceIdentityAddPolicy && a.IdentityCatalogPolicy == b.IdentityCatalogPolicy && a.CompletenessProfileID == b.CompletenessProfileID && sameStringSet(a.LifecycleScopes, b.LifecycleScopes) && a.LifecycleEvidenceSHA256 == b.LifecycleEvidenceSHA256 && sameLifecycleExclusions(a.LifecycleExclusions, b.LifecycleExclusions) && a.OfficialSelectabilityScope == b.OfficialSelectabilityScope && a.OfficialSelectabilitySHA256 == b.OfficialSelectabilitySHA256 && a.OfficialSelectabilityObservedAt.Equal(b.OfficialSelectabilityObservedAt) && a.OfficialSelectabilityExpiresAt.Equal(b.OfficialSelectabilityExpiresAt) && reflect.DeepEqual(a.Before, b.Before) && reflect.DeepEqual(a.After, b.After) && reflect.DeepEqual(a.AbsenceCountsBefore, b.AbsenceCountsBefore) && reflect.DeepEqual(a.AbsenceCountsAfter, b.AbsenceCountsAfter) && reflect.DeepEqual(a.Changes, b.Changes) && reflect.DeepEqual(a.Conflicts, b.Conflicts) && reflect.DeepEqual(a.UnreviewedModels, b.UnreviewedModels) && reflect.DeepEqual(a.CatalogModels, b.CatalogModels) && reflect.DeepEqual(a.CatalogWarningCodes, b.CatalogWarningCodes)
 }
 
 func sameStringSet(a, b []string) bool {
