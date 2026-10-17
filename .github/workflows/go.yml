@@ -1,0 +1,36 @@
+name: Go CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./... -count=1
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...

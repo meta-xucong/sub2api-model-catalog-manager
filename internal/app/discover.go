@@ -29,11 +29,12 @@ type DiscoveryResult struct {
 // DiscoveryPreflight contains the exact validated local rules/state snapshots
 // carried across the startup OEM sync boundary.
 type DiscoveryPreflight struct {
-	Rules      catalog.Rules
-	RulesHash  string
-	LocalState state.State
-	StateHash  string
-	FullScreen bool
+	Rules                       catalog.Rules
+	RulesHash                   string
+	OfficialSelectabilitySHA256 string
+	LocalState                  state.State
+	StateHash                   string
+	FullScreen                  bool
 }
 
 type Discoverer struct {
@@ -165,7 +166,11 @@ func (d Discoverer) Preflight(cfg config.Config) (DiscoveryPreflight, error) {
 	if !cfg.AllowNativeSyncMetadataWrite {
 		return prepared, errors.New("discovery blocked: native sync metadata side effect is disabled")
 	}
-	rules, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
+	now := time.Now().UTC()
+	if d.Now != nil {
+		now = d.Now().UTC()
+	}
+	rules, rulesHash, officialHash, err := loadRulesWithOfficialSnapshot(cfg, now)
 	if err != nil {
 		return prepared, err
 	}
@@ -198,7 +203,7 @@ func (d Discoverer) Preflight(cfg config.Config) (DiscoveryPreflight, error) {
 	if err != nil {
 		return prepared, err
 	}
-	prepared = DiscoveryPreflight{Rules: rules, RulesHash: rulesHash, LocalState: localState, StateHash: stateHash, FullScreen: d.FullScreen}
+	prepared = DiscoveryPreflight{Rules: rules, RulesHash: rulesHash, OfficialSelectabilitySHA256: officialHash, LocalState: localState, StateHash: stateHash, FullScreen: d.FullScreen}
 	return prepared, nil
 }
 
@@ -217,13 +222,24 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		return result, err
 	}
 	defer lock.Release()
+	officialLock, err := acquireOfficialSelectabilityLock(cfg)
+	if err != nil {
+		return result, errors.New("discovery blocked: official selectability evidence is being refreshed")
+	}
+	if officialLock != nil {
+		defer officialLock.Release()
+	}
 	statePath := filepath.Join(cfg.StateDir, "state.json")
 	currentStateHash, hashErr := optionalStateHash(statePath)
 	if hashErr != nil || currentStateHash != prepared.StateHash {
 		return result, errors.New("discovery stopped: local state changed after preflight")
 	}
 	localState := prepared.LocalState
-	if currentRules, currentHash, rulesErr := catalog.LoadRulesWithHash(cfg.RulesFile); rulesErr != nil || currentHash != prepared.RulesHash {
+	checkNow := time.Now().UTC()
+	if d.Now != nil {
+		checkNow = d.Now().UTC()
+	}
+	if currentRules, currentHash, officialHash, rulesErr := loadRulesWithOfficialSnapshot(cfg, checkNow); rulesErr != nil || currentHash != prepared.RulesHash || officialHash != prepared.OfficialSelectabilitySHA256 {
 		return result, errors.New("discovery stopped: local rules changed after preflight")
 	} else {
 		_ = currentRules
