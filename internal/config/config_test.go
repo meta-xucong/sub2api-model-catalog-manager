@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -168,7 +169,14 @@ func TestConfigLoadStrictJSONAndDefaultsPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ApplyModeValue() != "preview" || !strings.HasSuffix(cfg.StateDir, "state") || !strings.HasSuffix(cfg.RulesFile, "model-rules.json") || cfg.Credential.WindowsCredentialTarget == "" {
+	credentialDefaultMissing := false
+	switch runtime.GOOS {
+	case "windows":
+		credentialDefaultMissing = cfg.Credential.WindowsCredentialTarget == ""
+	case "linux":
+		credentialDefaultMissing = cfg.Credential.SystemdCredentialName == ""
+	}
+	if cfg.ApplyModeValue() != "preview" || !strings.HasSuffix(cfg.StateDir, "state") || !strings.HasSuffix(cfg.RulesFile, "model-rules.json") || credentialDefaultMissing {
 		t.Fatalf("defaults were not applied: %#v", cfg)
 	}
 	if err := cfg.ExposureGateFor([]int64{9001}); err == nil {
