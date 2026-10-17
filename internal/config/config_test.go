@@ -57,6 +57,35 @@ func TestConfigUsesFailClosedDefaultsAndExactAccountMemoryGate(t *testing.T) {
 	}
 }
 
+func TestOfficialSelectabilitySourcesRequireFixedAPIProductAndOSSecretRef(t *testing.T) {
+	cfg := validConfig()
+	cfg.OfficialSelectabilitySources = []OfficialSelectabilitySource{{Scope: "official-account:openai-api-a", Provider: "openai-api", Product: "api", Credential: CredentialConfig{WindowsCredentialTarget: "OpenAI account A"}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid official source rejected: %v", err)
+	}
+	cases := []func(*Config){
+		func(c *Config) { c.OfficialSelectabilitySources[0].Provider = "custom-gateway" },
+		func(c *Config) { c.OfficialSelectabilitySources[0].Product = "chatgpt-ui" },
+		func(c *Config) { c.OfficialSelectabilitySources[0].Credential = CredentialConfig{} },
+		func(c *Config) { c.OfficialSelectabilitySources[0].Scope = "https://gateway.example" },
+		func(c *Config) { c.OfficialSelectabilitySources[0].Scope = "official-account:bad/scope" },
+		func(c *Config) {
+			c.OfficialSelectabilitySources[0].Scope = "official-account:" + strings.Repeat("a", 120)
+		},
+		func(c *Config) {
+			c.OfficialSelectabilitySources = append(c.OfficialSelectabilitySources, c.OfficialSelectabilitySources[0])
+		},
+	}
+	for i, mutate := range cases {
+		bad := validConfig()
+		bad.OfficialSelectabilitySources = append([]OfficialSelectabilitySource(nil), cfg.OfficialSelectabilitySources...)
+		mutate(&bad)
+		if err := bad.Validate(); err == nil {
+			t.Fatalf("invalid source case %d accepted", i)
+		}
+	}
+}
+
 func TestAllAccountScopeRequiresExplicitGlobalMemoryAcknowledgement(t *testing.T) {
 	cfg := validConfig()
 	cfg.AccountScope = "all"

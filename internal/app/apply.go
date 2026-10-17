@@ -42,17 +42,18 @@ type ApplyResult struct {
 // startup OEM sync. ApplyPrepared rechecks the state digest under the run lock
 // and stops if another process changed it in the meantime.
 type ApplyPreflight struct {
-	Rules             catalog.Rules
-	RulesHash         string
-	LocalState        state.State
-	StateHash         string
-	PlanSHA256        string
-	PlanFingerprint   string
-	ConfigFingerprint string
-	Confirmation      string
-	Automatic         bool
-	ManualOnly        bool
-	FullScreen        bool
+	Rules                       catalog.Rules
+	RulesHash                   string
+	OfficialSelectabilitySHA256 string
+	LocalState                  state.State
+	StateHash                   string
+	PlanSHA256                  string
+	PlanFingerprint             string
+	ConfigFingerprint           string
+	Confirmation                string
+	Automatic                   bool
+	ManualOnly                  bool
+	FullScreen                  bool
 }
 
 // Apply requires an exact raw plan digest for manual use. Automatic use is
@@ -114,7 +115,7 @@ func (a Applier) Preflight(cfg config.Config, plan catalog.ApprovalPlan, planSHA
 	if plan.AccountScope != cfg.AccountScopeValue() {
 		return prepared, errors.New("apply blocked: plan account scope differs from current configuration")
 	}
-	rules, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
+	rules, rulesHash, officialHash, err := loadRulesWithOfficialSnapshot(cfg, now().UTC())
 	if err != nil {
 		return prepared, err
 	}
@@ -154,7 +155,7 @@ func (a Applier) Preflight(cfg config.Config, plan catalog.ApprovalPlan, planSHA
 	if err != nil {
 		return prepared, errors.New("apply config fingerprint could not be computed")
 	}
-	return ApplyPreflight{Rules: rules, RulesHash: rulesHash, LocalState: localState, StateHash: stateHash,
+	return ApplyPreflight{Rules: rules, RulesHash: rulesHash, OfficialSelectabilitySHA256: officialHash, LocalState: localState, StateHash: stateHash,
 		PlanSHA256: planSHA256, PlanFingerprint: planFingerprint, ConfigFingerprint: configFingerprint,
 		Confirmation: confirmation, Automatic: automatic, ManualOnly: a.ManualOnlyOnly, FullScreen: a.FullScreen}, nil
 }
@@ -177,10 +178,24 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		return result, err
 	}
 	defer lock.Release()
+	officialLock, err := acquireOfficialSelectabilityLock(cfg)
+	if err != nil {
+		return result, errors.New("apply blocked: official selectability evidence is being refreshed")
+	}
+	if officialLock != nil {
+		defer officialLock.Release()
+	}
 	statePath := filepath.Join(cfg.StateDir, "state.json")
 	currentStateHash, err := optionalStateHash(statePath)
 	if err != nil || currentStateHash != prepared.StateHash {
 		return result, errors.New("apply stopped: local state changed after preflight")
+	}
+	checkNow := time.Now().UTC()
+	if a.Now != nil {
+		checkNow = a.Now().UTC()
+	}
+	if _, _, currentOfficialHash, officialErr := loadRulesWithOfficialSnapshot(cfg, checkNow); officialErr != nil || currentOfficialHash != prepared.OfficialSelectabilitySHA256 {
+		return result, errors.New("apply stopped: official selectability evidence changed or expired after preflight")
 	}
 	localState := prepared.LocalState
 	stateHash := prepared.StateHash

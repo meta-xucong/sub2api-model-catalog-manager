@@ -26,6 +26,7 @@ import (
 	"sub2api-model-catalog-manager/internal/inventorysummary"
 	"sub2api-model-catalog-manager/internal/mergereview"
 	"sub2api-model-catalog-manager/internal/officialcatalog"
+	"sub2api-model-catalog-manager/internal/officialselectability"
 	"sub2api-model-catalog-manager/internal/report"
 	"sub2api-model-catalog-manager/internal/securecred"
 	"sub2api-model-catalog-manager/internal/state"
@@ -577,7 +578,7 @@ func fullScreenFlagState(args []string) (enabled, invalid bool) {
 
 func validFullScreenReason(code string) bool {
 	switch code {
-	case "completed", "no_applicable_plan", "account_scan_partial", "native_refresh_running", "native_refresh_status_unavailable", "native_refresh_status_unknown", "manager_lock_requires_review", "configuration_invalid", "credential_unavailable", "discovery_failed", "approved_rules_blocked", "apply_partial", "apply_failed":
+	case "completed", "no_applicable_plan", "account_scan_partial", "native_refresh_running", "native_refresh_status_unavailable", "native_refresh_status_unknown", "manager_lock_requires_review", "configuration_invalid", "credential_unavailable", "discovery_failed", "official_selectability_refresh_failed", "approved_rules_blocked", "apply_partial", "apply_failed":
 		return true
 	default:
 		return false
@@ -692,6 +693,17 @@ func runAutomaticCore(args []string, readCredential app.CredentialReader, newCli
 		}
 	} else if cfg.AllowFullScreenMode {
 		return errors.New("this config is reserved for --full-screen")
+	}
+	if *fullScreen {
+		refreshCtx, cancelRefresh := context.WithTimeout(context.Background(), 10*time.Minute)
+		err := syncOfficialSelectabilitySources(refreshCtx, cfg, securecred.ReadExternal, officialselectability.NewHTTPDoer(), time.Now)
+		cancelRefresh()
+		if err != nil {
+			if terminal != nil {
+				terminal.set("blocked", "official_selectability_refresh_failed", nil, app.ApplyResult{}, "")
+			}
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()

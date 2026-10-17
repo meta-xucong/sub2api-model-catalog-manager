@@ -1011,8 +1011,8 @@ func ownerAvailabilityWorkflowFixture(t *testing.T, fullScreen bool, liveModels 
 	rules := ownerAvailabilityRulesFixture()
 	rules.SourceProfiles = []catalog.SourceProfile{{
 		Source: source, BuildID: "test-build", APIContractID: config.APIContractAllAccountsV1, Decision: "approved",
-		OfficialSelectabilityScope: "official-account:test-owner-account",
-		LifecycleScopes:            []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
+		OfficialSelectabilityScope: "official-account:test-owner-account", OfficialSelectabilityProduct: "ui",
+		LifecycleScopes: []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
 		Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-14",
 	}}
 	writeWorkflowRules(t, cfg.RulesFile, rules)
@@ -1678,7 +1678,7 @@ func workflowRules(account adminapi.Account) catalog.Rules {
 	return catalog.Rules{
 		SchemaVersion:           1,
 		Aliases:                 []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "exact reviewed fixture", ReviewedAt: "2026-10-11"}},
-		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:test-openai-account", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
+		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:test-openai-account", OfficialSelectabilityProduct: "ui", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
 		OfficialSelectability:   []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "canonical-name", "gpt-5.2", "gpt-5.2-pro", "gpt-5.4", "new-model", "model", "stable", "existing", "unreviewed", "unknown", "brand-new-opaque-id", "claude-haiku-4-5-20251001", "preferred", "snapshot", "canonical", "other", "keep", "keep-me", "still-live", "provider-alias", "old-model", "stale-model", "keep-model", "old"}, ObservedAt: time.Date(2026, 10, 10, 20, 10, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 10, 11, 20, 10, 0, 0, time.UTC), Evidence: "synthetic official account selector fixture"}},
 		CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 		VersionFamilies:         []catalog.VersionFamily{},

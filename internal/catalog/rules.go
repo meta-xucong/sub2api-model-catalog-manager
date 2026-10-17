@@ -93,16 +93,18 @@ type RetiredRule struct {
 }
 
 type SourceProfile struct {
-	Source                     Source   `json:"source"`
-	BuildID                    string   `json:"build_id"`
-	APIContractID              string   `json:"api_contract_id"`
-	Decision                   string   `json:"decision"`
-	OfficialSelectabilityScope string   `json:"official_selectability_scope"`
-	LifecycleScopes            []string `json:"lifecycle_scopes,omitempty"`
-	IdentityAddPolicy          string   `json:"identity_add_policy,omitempty"`
-	IdentityCatalogPolicy      string   `json:"identity_catalog_policy,omitempty"`
-	Evidence                   string   `json:"evidence"`
-	ReviewedAt                 string   `json:"reviewed_at"`
+	Source                        Source   `json:"source"`
+	BuildID                       string   `json:"build_id"`
+	APIContractID                 string   `json:"api_contract_id"`
+	Decision                      string   `json:"decision"`
+	OfficialSelectabilityScope    string   `json:"official_selectability_scope"`
+	OfficialSelectabilityProduct  string   `json:"official_selectability_product,omitempty"`
+	OfficialSelectabilityProvider string   `json:"official_selectability_provider,omitempty"`
+	LifecycleScopes               []string `json:"lifecycle_scopes,omitempty"`
+	IdentityAddPolicy             string   `json:"identity_add_policy,omitempty"`
+	IdentityCatalogPolicy         string   `json:"identity_catalog_policy,omitempty"`
+	Evidence                      string   `json:"evidence"`
+	ReviewedAt                    string   `json:"reviewed_at"`
 }
 
 type CompleteCatalogProfile struct {
@@ -211,7 +213,7 @@ func (r Rules) Validate() error {
 			policy = "report_only"
 		}
 		identityCatalogPolicy := profile.IdentityCatalogPolicy
-		if strings.TrimSpace(profile.BuildID) == "" || (profile.APIContractID != "admin-catalog-v1" && profile.APIContractID != "admin-catalog-all-v1") || !approved(profile.Decision, profile.Evidence, profile.ReviewedAt) || (policy != "report_only" && policy != "add_exact") || (identityCatalogPolicy != "" && identityCatalogPolicy != "replace_identity_from_live_list" && identityCatalogPolicy != "add_identity_from_live_list") || (profile.OfficialSelectabilityScope != "" && !validOfficialSelectabilityScope(profile.OfficialSelectabilityScope)) {
+		if strings.TrimSpace(profile.BuildID) == "" || (profile.APIContractID != "admin-catalog-v1" && profile.APIContractID != "admin-catalog-all-v1") || !approved(profile.Decision, profile.Evidence, profile.ReviewedAt) || (policy != "report_only" && policy != "add_exact") || (identityCatalogPolicy != "" && identityCatalogPolicy != "replace_identity_from_live_list" && identityCatalogPolicy != "add_identity_from_live_list") || (profile.OfficialSelectabilityScope != "" && !validOfficialSelectabilityScope(profile.OfficialSelectabilityScope)) || (profile.OfficialSelectabilityProduct != "" && profile.OfficialSelectabilityProduct != "api" && profile.OfficialSelectabilityProduct != "ui") || !validOfficialSelectabilityProductBinding(profile) {
 			return fmt.Errorf("source_profile[%d] is incomplete or invalid", i)
 		}
 		seenScopes := map[string]bool{}
@@ -256,6 +258,24 @@ func (r Rules) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validOfficialSelectabilityProductBinding(profile SourceProfile) bool {
+	switch profile.OfficialSelectabilityProduct {
+	case "":
+		return profile.OfficialSelectabilityScope == "" && profile.OfficialSelectabilityProvider == ""
+	case "api":
+		switch profile.OfficialSelectabilityProvider {
+		case "openai-api", "anthropic-api", "xai-api", "deepseek-api":
+			return profile.OfficialSelectabilityScope != ""
+		default:
+			return false
+		}
+	case "ui":
+		return profile.OfficialSelectabilityScope != "" && profile.OfficialSelectabilityProvider == ""
+	default:
+		return false
+	}
 }
 
 func validProductLifecycleScope(scope string) bool {

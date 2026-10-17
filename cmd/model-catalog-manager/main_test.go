@@ -973,7 +973,7 @@ func automaticFixture(t *testing.T, approvedHash string) (string, *mainWorkflowA
 	rules := catalog.Rules{
 		SchemaVersion:         1,
 		Aliases:               []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "reviewed exact mock rule", ReviewedAt: date}},
-		SourceProfiles:        []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", OfficialSelectabilityScope: "official-account:test-openai-account", Evidence: "mock-only build/API scope", ReviewedAt: date}},
+		SourceProfiles:        []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", OfficialSelectabilityScope: "official-account:test-openai-account", OfficialSelectabilityProduct: "ui", Evidence: "mock-only build/API scope", ReviewedAt: date}},
 		OfficialSelectability: []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "new-model", "canonical-name", "keep", "raw-v2"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "synthetic complete selector fixture"}},
 		VersionFamilies:       []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 	}

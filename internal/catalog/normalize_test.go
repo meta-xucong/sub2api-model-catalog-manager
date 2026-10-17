@@ -99,7 +99,7 @@ func TestOfficialAccountSelectabilityOverridesKeepAndRetirementRules(t *testing.
 	source := sourceFixture()
 	now := time.Now().UTC().Truncate(time.Second)
 	rules := baseRules()
-	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", OfficialSelectabilityProduct: "ui", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
 	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"stable"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
 	rules.VersionFamilies = []VersionFamily{exactFamily(source, "gpt-5.2", "gpt-5.2", FamilyMember{UpstreamID: "gpt-5.2", ExactIDAction: "keep"})}
 	rules.RetiredModels = []RetiredRule{{Source: source, UpstreamID: "stable", PublicID: "stable", Decision: "approved", Evidence: "old lifecycle note says retired", ReviewedAt: now.Format("2006-01-02")}}
@@ -131,7 +131,7 @@ func TestOfficialAccountSelectabilityMissingOrStaleBlocksAllChanges(t *testing.T
 	source := sourceFixture()
 	now := time.Now().UTC().Truncate(time.Second)
 	base := baseRules()
-	base.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	base.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", OfficialSelectabilityProduct: "ui", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
 	cases := []struct {
 		name  string
 		rules Rules
@@ -161,7 +161,7 @@ func TestOfficialAccountSelectabilityDoesNotClassifyWildcardRoutes(t *testing.T)
 	source := sourceFixture()
 	now := time.Now().UTC().Truncate(time.Second)
 	rules := baseRules()
-	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", OfficialSelectabilityProduct: "ui", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
 	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"selected-model"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
 	fingerprint := SourceFingerprint(source)
 	current := map[string]string{"*": "*", "gpt-*": "gpt-*", "model?x": "model?x", "old-model": "old-model"}
@@ -194,17 +194,39 @@ func TestOfficialSelectabilityRequiresAccountIdentityAlias(t *testing.T) {
 	source := sourceFixture()
 	for _, scope := range []string{"openai_codex_chatgpt_login", "", "official-account:", "official-account:openai account"} {
 		rules := baseRules()
-		rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: scope, Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+		rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: scope, OfficialSelectabilityProduct: "ui", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
 		rules.OfficialSelectability = []OfficialSelectability{{Scope: scope, Complete: true, ModelIDs: []string{"selected-model"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
 		if err := rules.Validate(); err == nil {
 			t.Errorf("non-account-specific selector scope %q was accepted", scope)
 		}
 	}
 	rules := baseRules()
-	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", OfficialSelectabilityProduct: "ui", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
 	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"*"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "invalid wildcard selector fixture"}}
 	if err := rules.Validate(); err == nil {
 		t.Fatal("wildcard routing patterns were accepted as official selectable model IDs")
+	}
+}
+
+func TestScopedOfficialSelectabilityRequiresProductClassification(t *testing.T) {
+	now := time.Now().UTC()
+	source := sourceFixture()
+	baseProfile := SourceProfile{
+		Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved",
+		OfficialSelectabilityScope: "official-account:openai-test-account",
+		Evidence:                   "synthetic source profile", ReviewedAt: now.Format("2006-01-02"),
+	}
+	for _, product := range []string{"", "api", "ui"} {
+		rules := baseRules()
+		profile := baseProfile
+		profile.OfficialSelectabilityProduct = product
+		if product == "api" {
+			profile.OfficialSelectabilityProvider = "openai-api"
+		}
+		rules.SourceProfiles = []SourceProfile{profile}
+		if err := rules.Validate(); (product == "") != (err != nil) {
+			t.Errorf("product classification %q validation error = %v, want rejected only when unclassified", product, err)
+		}
 	}
 }
 

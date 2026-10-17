@@ -1,6 +1,6 @@
 # Sub2API Model Catalog Manager
 
-独立的 Go 命令行工具，用于读取 Sub2API 管理 API 的上游模型目录、对照官方生命周期资料生成筛分与映射计划，并在明确配置的规则哈希门禁通过后应用映射。
+独立的 Go 命令行工具，用于读取 Sub2API 管理 API 的上游模型目录、按产品范围同步官方模型可用性证据、生成筛分与映射计划，并在明确配置的规则哈希门禁通过后应用映射。
 
 ## 当前适用范围
 
@@ -15,6 +15,9 @@
 - 启动前必须人工检查目标、全账号范围、凭据暴露接受项、元数据同步开关、规则文件及其 SHA-256。不要把空白/示例配置直接改成自动应用。
 - Windows 一键脚本从项目目录下 `secrets/404token-admin-api-key.dpapi` 读取本机 DPAPI 保护的 key。该文件按 Windows 用户/机器保护，不随仓库分发；在当前 Windows 用户下重新创建。`secrets/` 已加入忽略规则。
 - 报告会含账号 ID、模型名和映射信息，按敏感运维数据保管。
+- 一键全量筛分会先从已配置的官方 API-key 账号拉取模型目录，再执行 404token 目录同步、计划和既有门禁应用。API 产品必须配置匹配的官方来源；缺失或失败时阻断，不使用手工快照兜底。
+- ChatGPT、Codex、Claude 网页端等 UI 产品仍只接受各自网页选择器的手工快照；API `/models` 不代表网页账号权限。官方可用性按具体产品隔离。
+- 官方 API 密钥单独保存在 Windows Credential Manager 或 systemd credential 中，不复用 Sub2API 管理密钥或网关账号密钥。初版固定支持 OpenAI API、Anthropic API、xAI API、DeepSeek API；其它 provider/区域需先新增并审核 adapter。
 
 ## 构建
 
