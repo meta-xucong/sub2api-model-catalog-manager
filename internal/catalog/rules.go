@@ -23,9 +23,25 @@ type Rules struct {
 	VersionFamilies          []VersionFamily           `json:"version_families"`
 	RetiredModels            []RetiredRule             `json:"retired_models"`
 	OwnerLifecycleExclusions []OwnerLifecycleExclusion `json:"owner_lifecycle_exclusions,omitempty"`
+	OfficialSelectability    []OfficialSelectability   `json:"official_selectability"`
 	SourceProfiles           []SourceProfile           `json:"source_profiles"`
 	CompleteCatalogProfiles  []CompleteCatalogProfile  `json:"complete_catalog_profiles"`
 }
+
+// OfficialSelectability is an operator-reviewed, complete snapshot of model
+// IDs that the corresponding official account can currently select. It is
+// the sole authority for model eligibility; other catalogs and lifecycle
+// rules may not override it.
+type OfficialSelectability struct {
+	Scope      string    `json:"scope"`
+	Complete   bool      `json:"complete"`
+	ModelIDs   []string  `json:"model_ids"`
+	ObservedAt time.Time `json:"observed_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Evidence   string    `json:"evidence"`
+}
+
+const OfficialSelectabilityMaxAge = 24 * time.Hour
 
 type OwnerLifecycleExclusion struct {
 	Scope      string `json:"scope"`
@@ -77,15 +93,16 @@ type RetiredRule struct {
 }
 
 type SourceProfile struct {
-	Source                Source   `json:"source"`
-	BuildID               string   `json:"build_id"`
-	APIContractID         string   `json:"api_contract_id"`
-	Decision              string   `json:"decision"`
-	LifecycleScopes       []string `json:"lifecycle_scopes,omitempty"`
-	IdentityAddPolicy     string   `json:"identity_add_policy,omitempty"`
-	IdentityCatalogPolicy string   `json:"identity_catalog_policy,omitempty"`
-	Evidence              string   `json:"evidence"`
-	ReviewedAt            string   `json:"reviewed_at"`
+	Source                     Source   `json:"source"`
+	BuildID                    string   `json:"build_id"`
+	APIContractID              string   `json:"api_contract_id"`
+	Decision                   string   `json:"decision"`
+	OfficialSelectabilityScope string   `json:"official_selectability_scope"`
+	LifecycleScopes            []string `json:"lifecycle_scopes,omitempty"`
+	IdentityAddPolicy          string   `json:"identity_add_policy,omitempty"`
+	IdentityCatalogPolicy      string   `json:"identity_catalog_policy,omitempty"`
+	Evidence                   string   `json:"evidence"`
+	ReviewedAt                 string   `json:"reviewed_at"`
 }
 
 type CompleteCatalogProfile struct {
@@ -194,7 +211,7 @@ func (r Rules) Validate() error {
 			policy = "report_only"
 		}
 		identityCatalogPolicy := profile.IdentityCatalogPolicy
-		if strings.TrimSpace(profile.BuildID) == "" || (profile.APIContractID != "admin-catalog-v1" && profile.APIContractID != "admin-catalog-all-v1") || !approved(profile.Decision, profile.Evidence, profile.ReviewedAt) || (policy != "report_only" && policy != "add_exact") || (identityCatalogPolicy != "" && identityCatalogPolicy != "replace_identity_from_live_list" && identityCatalogPolicy != "add_identity_from_live_list") {
+		if strings.TrimSpace(profile.BuildID) == "" || (profile.APIContractID != "admin-catalog-v1" && profile.APIContractID != "admin-catalog-all-v1") || !approved(profile.Decision, profile.Evidence, profile.ReviewedAt) || (policy != "report_only" && policy != "add_exact") || (identityCatalogPolicy != "" && identityCatalogPolicy != "replace_identity_from_live_list" && identityCatalogPolicy != "add_identity_from_live_list") || (profile.OfficialSelectabilityScope != "" && !validOfficialSelectabilityScope(profile.OfficialSelectabilityScope)) {
 			return fmt.Errorf("source_profile[%d] is incomplete or invalid", i)
 		}
 		seenScopes := map[string]bool{}
@@ -209,6 +226,23 @@ func (r Rules) Validate() error {
 			return fmt.Errorf("source_profile[%d] duplicates a source/build/API profile", i)
 		}
 		sourceProfileKeys[key] = true
+	}
+	selectabilityByScope := make(map[string]OfficialSelectability, len(r.OfficialSelectability))
+	for i, snapshot := range r.OfficialSelectability {
+		if !validOfficialSelectabilityScope(snapshot.Scope) || !snapshot.Complete || len(snapshot.ModelIDs) == 0 || snapshot.ObservedAt.IsZero() || snapshot.ExpiresAt.IsZero() || !snapshot.ExpiresAt.After(snapshot.ObservedAt) || snapshot.ExpiresAt.Sub(snapshot.ObservedAt) > OfficialSelectabilityMaxAge || strings.TrimSpace(snapshot.Evidence) == "" {
+			return fmt.Errorf("official_selectability[%d] is incomplete or invalid", i)
+		}
+		ids := make(map[string]bool, len(snapshot.ModelIDs))
+		for _, id := range snapshot.ModelIDs {
+			if !validID(id) || IsWildcard(id) || ids[id] {
+				return fmt.Errorf("official_selectability[%d] has an invalid or duplicate model ID", i)
+			}
+			ids[id] = true
+		}
+		if _, exists := selectabilityByScope[snapshot.Scope]; exists {
+			return fmt.Errorf("official_selectability[%d] duplicates a scope", i)
+		}
+		selectabilityByScope[snapshot.Scope] = snapshot
 	}
 	for i, profile := range r.CompleteCatalogProfiles {
 		if err := validateSource(profile.Source); err != nil {
@@ -231,6 +265,26 @@ func validProductLifecycleScope(scope string) bool {
 	default:
 		return false
 	}
+}
+
+// Official selectability belongs to a concrete upstream account identity, not
+// to a provider or protocol category. Use a stable, non-secret operator alias
+// so one account's visible model list cannot silently govern every account of
+// the same protocol. Multiple profiles may share the alias only when they
+// intentionally use the same official account.
+func validOfficialSelectabilityScope(scope string) bool {
+	const prefix = "official-account:"
+	if !strings.HasPrefix(scope, prefix) || len(scope) <= len(prefix) || len(scope) > 128 {
+		return false
+	}
+	alias := scope[len(prefix):]
+	for _, r := range alias {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return alias[0] != '.' && alias[0] != '-' && alias[0] != '_'
 }
 
 func sourceProfileKey(profile SourceProfile) string {
@@ -270,6 +324,18 @@ func (r Rules) MatchCompleteCatalogProfile(source Source) (CompleteCatalogProfil
 		found = true
 	}
 	return match, found
+}
+
+func (r Rules) OfficialSelectabilityForScope(scope string) (OfficialSelectability, bool) {
+	if !validOfficialSelectabilityScope(scope) {
+		return OfficialSelectability{}, false
+	}
+	for _, snapshot := range r.OfficialSelectability {
+		if snapshot.Scope == scope {
+			return snapshot, true
+		}
+	}
+	return OfficialSelectability{}, false
 }
 
 func approved(decision, evidence, reviewedAt string) bool {

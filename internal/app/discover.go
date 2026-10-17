@@ -419,7 +419,6 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		sort.Strings(baseRow.LifecycleScopes)
 		sort.Strings(lifecycleBlockedScopes)
 		baseRow.LifecycleBlockedScopes = lifecycleBlockedScopes
-		ownerOnlyLifecycleScreen := d.FullScreen && len(lifecycleBlockedScopes) > 0 && exactOwnerAvailabilityRules(rules)
 		if len(profile.LifecycleScopes) == 0 {
 			baseRow.LifecycleScopeStatus = "not_configured"
 		} else if len(lifecycleBlockedScopes) == 0 {
@@ -465,20 +464,14 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		lifecycleExclusions := buildLifecycleExclusions(rules, profile.LifecycleScopes, d.LifecycleStartup, now().UTC())
 		baseRow.LifecycleExclusions = append([]catalog.LifecycleExclusion{}, lifecycleExclusions...)
 		identityAddPolicy := profile.IdentityAddPolicy
-		if ownerOnlyLifecycleScreen {
-			identityAddPolicy = "report_only"
-		}
-		normalizationRules := rules
-		if ownerOnlyLifecycleScreen {
-			normalizationRules = ownerOnlyNormalizationRules(rules)
-		}
-		plan, err := catalog.Normalize(normalizationRules, catalog.Input{
+		plan, err := catalog.Normalize(rules, catalog.Input{
 			AccountID: account.ID, Source: source, SourceIdentityAddPolicy: identityAddPolicy,
-			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (d.ManualOnlyOnly || d.FullScreen) && profile.IdentityCatalogPolicy != "" && !ownerOnlyLifecycleScreen,
+			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (d.ManualOnlyOnly || d.FullScreen) && profile.IdentityCatalogPolicy != "",
 			CurrentMapping: account.ModelMapping, ManagedMappings: local.ManagedMappings,
 			LiveModels: catalogResult.Models, LiveListAvailable: catalogResult.LiveListAvailable,
 			Completeness: completeness, CompletenessProfileID: completeProfileID, DirectoryHash: directoryHash,
-			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: lifecycleExclusions,
+			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: nil,
+			RequireOfficialSelectability: true, OfficialSelectabilityScope: profile.OfficialSelectabilityScope, Now: now().UTC(),
 		}, local)
 		if err != nil {
 			return result, err
@@ -487,17 +480,7 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		plan.CompletenessProfileID = completeProfileID
 		plan.CatalogWarningCodes = append([]string{}, warningCodes...)
 		if len(lifecycleBlockedScopes) > 0 {
-			if ownerOnlyLifecycleScreen && ownerOnlyLifecycleDelta(rules, profile.LifecycleScopes, lifecycleBlockedScopes, plan) {
-				plan.DiscoveryReason = "official lifecycle source is unavailable; only exact owner-confirmed removals are evaluated, aliases/version families/other retirement rules and identity additions are deferred, and newly observed IDs are not added in this plan"
-				baseRow.Reason = plan.DiscoveryReason
-			} else {
-				plan.ApplyEligible = false
-				plan.DiscoveryReason = "official product lifecycle sources are unavailable, stale, or invalid for a configured scope"
-				for _, lifecycleScope := range lifecycleBlockedScopes {
-					plan.Conflicts = append(plan.Conflicts, "product lifecycle scope is not ready; mapping changes are blocked: "+lifecycleScope)
-				}
-				sort.Strings(plan.Conflicts)
-			}
+			baseRow.Reason = "official selector snapshot is authoritative; product lifecycle documents are informational only"
 		}
 		if catalogWarningCodesBlockMappingApply(warningCodes) {
 			plan.ApplyEligible = false

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const ApprovalPlanSchemaVersion = 4
+const ApprovalPlanSchemaVersion = 5
 const ApprovalPlanTTL = 15 * time.Minute
 
 type TargetBinding struct {
@@ -57,7 +57,7 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 	}
 	seen := map[int64]bool{}
 	for _, account := range p.Accounts {
-		if account.AccountID <= 0 || seen[account.AccountID] || account.Before == nil || account.After == nil || account.AbsenceCountsBefore == nil || account.AbsenceCountsAfter == nil || !validAbsenceCounts(account.AbsenceCountsBefore) || !validAbsenceCounts(account.AbsenceCountsAfter) || account.Conflicts == nil || account.CatalogObservedAt.IsZero() || !validSHA256(account.DirectoryHash) || !validSHA256(account.SourceFingerprint) || !validSHA256(account.LifecycleEvidenceSHA256) || (account.IdentityCatalogPolicy != "" && account.IdentityCatalogPolicy != "replace_identity_from_live_list" && account.IdentityCatalogPolicy != "add_identity_from_live_list") {
+		if account.AccountID <= 0 || seen[account.AccountID] || account.Before == nil || account.After == nil || account.AbsenceCountsBefore == nil || account.AbsenceCountsAfter == nil || !validAbsenceCounts(account.AbsenceCountsBefore) || !validAbsenceCounts(account.AbsenceCountsAfter) || account.Conflicts == nil || account.CatalogObservedAt.IsZero() || !validSHA256(account.DirectoryHash) || !validSHA256(account.SourceFingerprint) || !validSHA256(account.LifecycleEvidenceSHA256) || (account.ApplyEligible && (!validOfficialSelectabilityScope(account.OfficialSelectabilityScope) || !validSHA256(account.OfficialSelectabilitySHA256) || account.OfficialSelectabilityObservedAt.IsZero() || account.OfficialSelectabilityExpiresAt.IsZero())) || (account.OfficialSelectabilityObservedAt.IsZero() != account.OfficialSelectabilityExpiresAt.IsZero()) || (!account.OfficialSelectabilityObservedAt.IsZero() && (!account.OfficialSelectabilityExpiresAt.After(account.OfficialSelectabilityObservedAt) || account.OfficialSelectabilityExpiresAt.Sub(account.OfficialSelectabilityObservedAt) > OfficialSelectabilityMaxAge)) || (account.IdentityCatalogPolicy != "" && account.IdentityCatalogPolicy != "replace_identity_from_live_list" && account.IdentityCatalogPolicy != "add_identity_from_live_list") {
 			return errors.New("approval plan contains an invalid account snapshot")
 		}
 		for i, scope := range account.LifecycleScopes {

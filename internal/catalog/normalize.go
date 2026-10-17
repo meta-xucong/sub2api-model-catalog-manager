@@ -22,20 +22,23 @@ const (
 )
 
 type Input struct {
-	AccountID                int64
-	Source                   Source
-	SourceIdentityAddPolicy  string
-	IdentityCatalogPolicy    string
-	AllowIdentityCatalogSync bool
-	CurrentMapping           map[string]string
-	ManagedMappings          map[string]state.ManagedMapping
-	LiveModels               []string
-	LiveListAvailable        bool
-	Completeness             Completeness
-	CompletenessProfileID    string
-	DirectoryHash            string
-	LifecycleScopes          []string
-	LifecycleExclusions      []LifecycleExclusion
+	AccountID                    int64
+	Source                       Source
+	SourceIdentityAddPolicy      string
+	IdentityCatalogPolicy        string
+	AllowIdentityCatalogSync     bool
+	CurrentMapping               map[string]string
+	ManagedMappings              map[string]state.ManagedMapping
+	LiveModels                   []string
+	LiveListAvailable            bool
+	Completeness                 Completeness
+	CompletenessProfileID        string
+	DirectoryHash                string
+	LifecycleScopes              []string
+	LifecycleExclusions          []LifecycleExclusion
+	RequireOfficialSelectability bool
+	OfficialSelectabilityScope   string
+	Now                          time.Time
 }
 
 type LifecycleExclusion struct {
@@ -64,33 +67,37 @@ type Change struct {
 }
 
 type Plan struct {
-	AccountID               int64                `json:"account_id"`
-	Source                  Source               `json:"source"`
-	SourceFingerprint       string               `json:"source_fingerprint"`
-	BeforeHash              string               `json:"before_mapping_hash"`
-	DirectoryHash           string               `json:"directory_hash,omitempty"`
-	CatalogObservedAt       time.Time            `json:"catalog_observed_at"`
-	CompletenessProfileID   string               `json:"completeness_profile_id,omitempty"`
-	SourceIdentityAddPolicy string               `json:"source_identity_add_policy"`
-	IdentityCatalogPolicy   string               `json:"identity_catalog_policy,omitempty"`
-	LifecycleScopes         []string             `json:"lifecycle_scopes,omitempty"`
-	LifecycleExclusions     []LifecycleExclusion `json:"lifecycle_exclusions,omitempty"`
-	LifecycleEvidenceSHA256 string               `json:"lifecycle_evidence_sha256"`
-	CatalogModels           []string             `json:"catalog_models"`
-	CatalogWarningCodes     []string             `json:"catalog_warning_codes"`
-	ApplyEligible           bool                 `json:"apply_eligible"`
-	DiscoveryReason         string               `json:"discovery_reason,omitempty"`
-	RulesHash               string               `json:"rules_hash"`
-	Completeness            Completeness         `json:"catalog_completeness"`
-	LiveListAvailable       bool                 `json:"live_list_available"`
-	Before                  map[string]string    `json:"before_mapping"`
-	After                   map[string]string    `json:"after_mapping"`
-	Changes                 []Change             `json:"changes"`
-	Conflicts               []string             `json:"conflicts"`
-	UnreviewedModels        []string             `json:"unreviewed_models"`
-	CreatedAt               time.Time            `json:"created_at"`
-	AbsenceCountsBefore     map[string]int       `json:"absence_counts_before"`
-	AbsenceCountsAfter      map[string]int       `json:"absence_counts_after"`
+	AccountID                       int64                `json:"account_id"`
+	Source                          Source               `json:"source"`
+	SourceFingerprint               string               `json:"source_fingerprint"`
+	BeforeHash                      string               `json:"before_mapping_hash"`
+	DirectoryHash                   string               `json:"directory_hash,omitempty"`
+	CatalogObservedAt               time.Time            `json:"catalog_observed_at"`
+	CompletenessProfileID           string               `json:"completeness_profile_id,omitempty"`
+	SourceIdentityAddPolicy         string               `json:"source_identity_add_policy"`
+	IdentityCatalogPolicy           string               `json:"identity_catalog_policy,omitempty"`
+	LifecycleScopes                 []string             `json:"lifecycle_scopes,omitempty"`
+	LifecycleExclusions             []LifecycleExclusion `json:"lifecycle_exclusions,omitempty"`
+	LifecycleEvidenceSHA256         string               `json:"lifecycle_evidence_sha256"`
+	OfficialSelectabilityScope      string               `json:"official_selectability_scope,omitempty"`
+	OfficialSelectabilitySHA256     string               `json:"official_selectability_sha256,omitempty"`
+	OfficialSelectabilityObservedAt time.Time            `json:"official_selectability_observed_at,omitempty"`
+	OfficialSelectabilityExpiresAt  time.Time            `json:"official_selectability_expires_at,omitempty"`
+	CatalogModels                   []string             `json:"catalog_models"`
+	CatalogWarningCodes             []string             `json:"catalog_warning_codes"`
+	ApplyEligible                   bool                 `json:"apply_eligible"`
+	DiscoveryReason                 string               `json:"discovery_reason,omitempty"`
+	RulesHash                       string               `json:"rules_hash"`
+	Completeness                    Completeness         `json:"catalog_completeness"`
+	LiveListAvailable               bool                 `json:"live_list_available"`
+	Before                          map[string]string    `json:"before_mapping"`
+	After                           map[string]string    `json:"after_mapping"`
+	Changes                         []Change             `json:"changes"`
+	Conflicts                       []string             `json:"conflicts"`
+	UnreviewedModels                []string             `json:"unreviewed_models"`
+	CreatedAt                       time.Time            `json:"created_at"`
+	AbsenceCountsBefore             map[string]int       `json:"absence_counts_before"`
+	AbsenceCountsAfter              map[string]int       `json:"absence_counts_after"`
 }
 
 func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
@@ -168,20 +175,51 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 	if input.Source.AccountID != 0 && input.Source.AccountID != input.AccountID {
 		return Plan{}, errors.New("source account ID does not match plan account")
 	}
-	if !input.LiveListAvailable || len(input.LiveModels) == 0 {
-		plan.ApplyEligible = false
-		plan.DiscoveryReason = "live catalog unavailable, fallback, or empty"
-		plan.Conflicts = append(plan.Conflicts, "live catalog is unavailable, fallback, or empty; mapping changes are blocked")
-		plan.UnreviewedModels = append([]string{}, input.LiveModels...)
-		return plan, nil
+	selectable := map[string]bool(nil)
+	if input.RequireOfficialSelectability {
+		snapshot, found := rules.OfficialSelectabilityForScope(input.OfficialSelectabilityScope)
+		if !found {
+			plan.ApplyEligible = false
+			plan.DiscoveryReason = "official account selectability snapshot is missing for the matched source profile"
+			plan.Conflicts = append(plan.Conflicts, "official account selectability is the only model eligibility authority; no exact approved snapshot is available")
+			plan.OfficialSelectabilityScope = input.OfficialSelectabilityScope
+			plan.OfficialSelectabilitySHA256 = hashMissingSelectability(input.Source, input.OfficialSelectabilityScope)
+			return plan, nil
+		}
+		plan.OfficialSelectabilityScope = snapshot.Scope
+		now := input.Now.UTC()
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		if !snapshot.Complete || snapshot.ObservedAt.After(now) || !snapshot.ExpiresAt.After(now) || now.Sub(snapshot.ObservedAt) > OfficialSelectabilityMaxAge {
+			plan.ApplyEligible = false
+			plan.DiscoveryReason = "official account selectability snapshot is incomplete, future-dated, or expired"
+			plan.Conflicts = append(plan.Conflicts, "official account selectability snapshot is not current; no mapping changes are permitted")
+			plan.OfficialSelectabilitySHA256 = hashSelectability(snapshot)
+			plan.OfficialSelectabilityObservedAt = snapshot.ObservedAt.UTC()
+			plan.OfficialSelectabilityExpiresAt = snapshot.ExpiresAt.UTC()
+			return plan, nil
+		}
+		plan.OfficialSelectabilitySHA256 = hashSelectability(snapshot)
+		plan.OfficialSelectabilityObservedAt = snapshot.ObservedAt.UTC()
+		plan.OfficialSelectabilityExpiresAt = snapshot.ExpiresAt.UTC()
+		ids := append([]string{}, snapshot.ModelIDs...)
+		sort.Strings(ids)
+		selectable = make(map[string]bool, len(ids))
+		for _, id := range ids {
+			selectable[id] = true
+		}
 	}
+	liveUsable := input.LiveListAvailable && len(input.LiveModels) > 0
 	live := make(map[string]bool, len(input.LiveModels))
 	for _, id := range input.LiveModels {
 		if !validID(id) {
 			plan.Conflicts = append(plan.Conflicts, "live catalog contains an invalid model ID")
 			return plan, nil
 		}
-		live[id] = true
+		if selectable == nil || selectable[id] {
+			live[id] = true
+		}
 	}
 	// Version families are account-scoped because a preferred upstream ID and
 	// its hide actions are evidence about one exact credential/source binding.
@@ -216,6 +254,60 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		current, exists := input.CurrentMapping[key]
 		return exists && current == owner.LastAppliedValue
 	}
+	// The current official account selector is the sole retention authority.
+	// Upstream catalog visibility and static retirement/family rules cannot
+	// retain a model that the account cannot select. Existing mappings may be
+	// removed only when this manager still owns their exact current value.
+	if selectable != nil {
+		keys := make([]string, 0, len(plan.After))
+		for publicID := range plan.After {
+			keys = append(keys, publicID)
+		}
+		sort.Strings(keys)
+		for _, publicID := range keys {
+			upstreamID := plan.After[publicID]
+			// Wildcard routes are routing policy, not concrete selectable model
+			// IDs. An account selector snapshot cannot certify or retire them.
+			if IsWildcard(upstreamID) {
+				continue
+			}
+			if selectable[upstreamID] {
+				continue
+			}
+			if !allowChanges(publicID) {
+				plan.ApplyEligible = false
+				plan.Conflicts = append(plan.Conflicts, "official account cannot select a model in an unmanaged or drifted mapping: "+publicID)
+				continue
+			}
+			delete(plan.After, publicID)
+			plan.Changes = append(plan.Changes, Change{Action: "remove", PublicID: publicID, Before: upstreamID, RuleKind: "official_selectability", Evidence: "complete current official account selectable-model snapshot", Reason: "model is absent from the official account's current selectable model list"})
+		}
+		if len(plan.Conflicts) > 0 {
+			sort.Strings(plan.Conflicts)
+			plan.DiscoveryReason = "official selectability conflicts with an unmanaged or drifted mapping"
+			return plan, nil
+		}
+	}
+	if !liveUsable {
+		// A verified official snapshot can safely retire manager-owned models,
+		// but an unavailable/incomplete gateway catalog cannot justify adding or
+		// changing routes. Keep the removal-only plan eligible if it is conflict-free.
+		if selectable == nil {
+			plan.ApplyEligible = false
+			plan.DiscoveryReason = "live catalog unavailable, fallback, or empty"
+			plan.Conflicts = append(plan.Conflicts, "live catalog is unavailable, fallback, or empty; mapping changes are blocked")
+			plan.UnreviewedModels = append([]string{}, input.LiveModels...)
+			return plan, nil
+		}
+		if len(plan.Changes) == 0 {
+			plan.ApplyEligible = false
+			plan.DiscoveryReason = "live catalog unavailable; no mapping changes are permitted"
+			plan.Conflicts = append(plan.Conflicts, "live catalog is unavailable, fallback, or empty; additions and updates are blocked")
+			return plan, nil
+		}
+		sort.Slice(plan.Changes, func(i, j int) bool { return plan.Changes[i].PublicID < plan.Changes[j].PublicID })
+		return plan, nil
+	}
 	excludedIDs := make(map[string]LifecycleExclusion, len(plan.LifecycleExclusions))
 	for _, exclusion := range plan.LifecycleExclusions {
 		if !validProductLifecycleScope(exclusion.Scope) || !containsString(plan.LifecycleScopes, exclusion.Scope) || !validID(exclusion.ModelID) || !validLifecycleExclusion(exclusion) {
@@ -224,7 +316,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		if previous, exists := excludedIDs[exclusion.ModelID]; exists && previous.Scope != exclusion.Scope {
 			return Plan{}, errors.New("lifecycle evidence assigns one model ID to multiple product scopes")
 		}
-		excludedIDs[exclusion.ModelID] = exclusion
+		if selectable == nil {
+			excludedIDs[exclusion.ModelID] = exclusion
+		}
 	}
 	if len(excludedIDs) > 0 {
 		for id := range excludedIDs {
@@ -327,9 +421,13 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				familyIDOwners[id] = family.PublicID
 			}
 			if !live[family.PreferredUpstreamID] {
-				plan.ApplyEligible = false
-				plan.DiscoveryReason = "live identity sync conflicts with an unavailable family target"
-				plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
+				// Selectability controls retention; upstream presence only controls
+				// whether a new/updated route can be materialized now.
+				if selectable == nil {
+					plan.ApplyEligible = false
+					plan.DiscoveryReason = "live identity sync conflicts with an unavailable family target"
+					plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
+				}
 				continue
 			}
 			if previous, exists := familyTargets[family.PublicID]; exists && previous.upstreamID != family.PreferredUpstreamID {
@@ -343,6 +441,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			for _, member := range family.Members {
 				familyCovered[member.UpstreamID] = true
 				if member.ExactIDAction == "hide" {
+					if selectable != nil {
+						continue
+					}
 					if keptFamily, kept := keptMembers[member.UpstreamID]; kept {
 						plan.ApplyEligible = false
 						plan.Conflicts = append(plan.Conflicts, "version families assign conflicting keep and hide actions to member: "+member.UpstreamID+" (family "+keptFamily+")")
@@ -388,6 +489,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		retired := make(map[string]RetiredRule)
 		for _, rule := range rules.RetiredModels {
 			if !SourceMatches(rule.Source, input.Source) {
+				continue
+			}
+			if selectable != nil {
 				continue
 			}
 			// This branch only reconciles exact identity mappings. A retirement
@@ -441,6 +545,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			if _, familyPublicID := familyTargets[publicID]; familyPublicID {
 				continue // Keep the canonical key for the reviewed overlay below.
 			}
+			if selectable != nil && selectable[upstreamID] {
+				continue
+			}
 			if rule, explicitlyRetired := retired[publicID]; explicitlyRetired {
 				if _, stillPresent := plan.After[publicID]; stillPresent {
 					delete(plan.After, publicID)
@@ -448,7 +555,7 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				}
 				continue
 			}
-			if live[publicID] || input.IdentityCatalogPolicy == "add_identity_from_live_list" {
+			if (selectable != nil && selectable[upstreamID]) || live[publicID] || input.IdentityCatalogPolicy == "add_identity_from_live_list" {
 				continue
 			}
 			delete(plan.After, publicID)
@@ -543,7 +650,11 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			continue
 		}
 		if !live[family.PreferredUpstreamID] {
-			plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
+			// The official selector determines eligibility. Gateway presence only
+			// gates whether this run can add or update a route.
+			if selectable == nil {
+				plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
+			}
 			continue
 		}
 		addDesired(family.PublicID, family.PreferredUpstreamID, "version_family", family.Evidence)
@@ -552,6 +663,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				addDesiredIfIdentityAbsent(plan.After, member.UpstreamID, member.UpstreamID, "version_family_keep", family.Evidence, &plan)
 			}
 			if member.ExactIDAction == "hide" {
+				if selectable != nil {
+					continue
+				}
 				if current, exists := plan.After[member.UpstreamID]; exists {
 					if current != member.UpstreamID {
 						plan.Conflicts = append(plan.Conflicts, "hide rule only supports exact identity mapping: "+member.UpstreamID)
@@ -587,6 +701,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		if !SourceMatches(rule.Source, input.Source) {
 			continue
 		}
+		if selectable != nil {
+			continue
+		}
 		current, exists := plan.After[rule.PublicID]
 		if !exists {
 			// Retiring an already absent exact key is idempotent and must not
@@ -604,7 +721,7 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		delete(plan.After, rule.PublicID)
 		plan.Changes = append(plan.Changes, Change{Action: "remove", PublicID: rule.PublicID, Before: current, RuleKind: "retired_model", Evidence: rule.Evidence, Reason: "exact source-scoped retirement rule"})
 	}
-	if input.Completeness == CompletenessComplete {
+	if input.Completeness == CompletenessComplete && selectable == nil {
 		plan.AbsenceCountsAfter, plan.Changes = updateCompleteCatalogAbsence(
 			plan.SourceFingerprint, live, managed, plan.AbsenceCountsAfter, plan.After, plan.Changes, allowChanges,
 		)
@@ -660,6 +777,34 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 	})
 	sort.Strings(plan.Conflicts)
 	return plan, nil
+}
+
+func hashMissingSelectability(source Source, scope string) string {
+	body, _ := json.Marshal(struct {
+		Source  string `json:"source_fingerprint"`
+		Scope   string `json:"scope"`
+		Missing bool   `json:"missing"`
+	}{SourceFingerprint(source), scope, true})
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:])
+}
+
+func hashSelectability(snapshot OfficialSelectability) string {
+	ids := append([]string{}, snapshot.ModelIDs...)
+	sort.Strings(ids)
+	body, err := json.Marshal(struct {
+		Scope      string    `json:"scope"`
+		Complete   bool      `json:"complete"`
+		ObservedAt time.Time `json:"observed_at"`
+		ExpiresAt  time.Time `json:"expires_at"`
+		ModelIDs   []string  `json:"model_ids"`
+		Evidence   string    `json:"evidence"`
+	}{snapshot.Scope, snapshot.Complete, snapshot.ObservedAt.UTC(), snapshot.ExpiresAt.UTC(), ids, snapshot.Evidence})
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:])
 }
 
 // isExactIdentityMapping excludes Sub2API wildcard patterns even when their

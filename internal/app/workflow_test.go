@@ -518,6 +518,50 @@ func TestDiscoveryFallbackEmptyAndWarningsDoNotCreateWritableCatalogPlan(t *test
 	}
 }
 
+func TestDiscoveryRequiresFreshOfficialSelectorAndBindsItIntoApply(t *testing.T) {
+	t.Run("missing snapshot blocks additions", func(t *testing.T) {
+		cfg, account, now := testWorkflowConfig(t, true, true)
+		rules := workflowRules(account)
+		rules.OfficialSelectability = nil
+		writeWorkflowRules(t, cfg.RulesFile, rules)
+		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known", "new-model"}, LiveListAvailable: true})
+		result, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
+		if err != nil || result.Plan == nil || result.Plan.Accounts[0].ApplyEligible || len(result.Plan.Accounts[0].Changes) != 0 || result.Plan.Accounts[0].After["new-model"] != "" {
+			t.Fatalf("missing selector did not fail closed: plan=%#v err=%v", result.Plan, err)
+		}
+	})
+	t.Run("expired snapshot blocks additions", func(t *testing.T) {
+		cfg, account, now := testWorkflowConfig(t, true, true)
+		rules := workflowRules(account)
+		rules.OfficialSelectability[0].ObservedAt = now.UTC().Add(-48 * time.Hour)
+		rules.OfficialSelectability[0].ExpiresAt = now.UTC().Add(-24 * time.Hour)
+		writeWorkflowRules(t, cfg.RulesFile, rules)
+		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known", "new-model"}, LiveListAvailable: true})
+		result, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
+		if err != nil || result.Plan == nil || result.Plan.Accounts[0].ApplyEligible || len(result.Plan.Accounts[0].Changes) != 0 || result.Plan.Accounts[0].After["new-model"] != "" {
+			t.Fatalf("expired selector did not fail closed: plan=%#v err=%v", result.Plan, err)
+		}
+	})
+	t.Run("selector change invalidates approved plan", func(t *testing.T) {
+		cfg, account, now := testWorkflowConfig(t, true, true)
+		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known"}, LiveListAvailable: true})
+		discovery, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
+		if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible {
+			t.Fatalf("valid selector fixture did not produce an eligible plan: plan=%#v err=%v", discovery.Plan, err)
+		}
+		rules, err := catalog.LoadRules(cfg.RulesFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rules.OfficialSelectability[0].ModelIDs = append(rules.OfficialSelectability[0].ModelIDs, "newly-selectable")
+		writeWorkflowRules(t, cfg.RulesFile, rules)
+		result, err := workflowApplier(api, now).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
+		if err == nil || !strings.Contains(err.Error(), "raw rules hash drifted") || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
+			t.Fatalf("changed selector snapshot did not invalidate the plan: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
+		}
+	})
+}
+
 func TestApplyOneIDMappingOnlyWriteReadbackAndPlanConsumption(t *testing.T) {
 	cfg, account, now := testWorkflowConfig(t, true, true)
 	api := newWorkflowAPI(account, now, adminapi.Catalog{
@@ -837,8 +881,8 @@ func TestFullScreenOwnerAvailabilityRemovalAppliesOnlyExactOwnedEdge(t *testing.
 		t.Fatalf("full-screen owner exception discovery failed: plan=%#v err=%v", discovery.Plan, err)
 	}
 	plan := discovery.Plan.Accounts[0]
-	if !plan.ApplyEligible || len(plan.Changes) != 1 || plan.Changes[0].Before != "gpt-5.2" || plan.Changes[0].After != "" || !strings.Contains(plan.DiscoveryReason, "owner-confirmed") {
-		t.Fatalf("plan was not limited to the owner-confirmed removal: %#v", plan)
+	if !plan.ApplyEligible || len(plan.Changes) != 1 || plan.Changes[0].Before != "gpt-5.2" || plan.Changes[0].After != "" || plan.Changes[0].RuleKind != "official_selectability" {
+		t.Fatalf("plan was not limited to the official-selector removal: %#v", plan)
 	}
 	result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
 	if err != nil || !reflect.DeepEqual(result.AppliedIDs, []int64{account.ID}) || len(api.bulkCalls) != 1 {
@@ -882,8 +926,8 @@ func TestOwnerAvailabilityExceptionRequiresOwnedUnchangedMapping(t *testing.T) {
 	}
 }
 
-func TestOwnerAvailabilityExceptionDoesNotAllowLiveAdditionsOrManualOnlyApply(t *testing.T) {
-	t.Run("live addition is deferred during owner-only removal", func(t *testing.T) {
+func TestOfficialSelectabilityOverridesLifecycleDocumentAvailability(t *testing.T) {
+	t.Run("officially selectable live addition remains eligible", func(t *testing.T) {
 		cfg, account, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable", "new-model"})
 		source, err := catalog.SourceForAccount(account.Platform, account.Type, account.Protocol, account.BaseURL, account.ID)
 		if err != nil {
@@ -903,22 +947,22 @@ func TestOwnerAvailabilityExceptionDoesNotAllowLiveAdditionsOrManualOnlyApply(t 
 		if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible {
 			t.Fatalf("owner-only removal was blocked instead of deferring live additions: plan=%#v err=%v", discovery.Plan, err)
 		}
-		if discovery.Plan.Accounts[0].IdentityCatalogPolicy != "" || discovery.Plan.Accounts[0].SourceIdentityAddPolicy != "report_only" || len(discovery.Plan.Accounts[0].Changes) != 1 || discovery.Plan.Accounts[0].Changes[0].Action != "remove" {
-			t.Fatalf("owner-only plan contains identity additions or another action: %#v", discovery.Plan.Accounts[0])
+		if discovery.Plan.Accounts[0].IdentityCatalogPolicy != "add_identity_from_live_list" || discovery.Plan.Accounts[0].SourceIdentityAddPolicy != "add_exact" || len(discovery.Plan.Accounts[0].Changes) != 2 {
+			t.Fatalf("official selector did not govern both removal and addition: %#v", discovery.Plan.Accounts[0])
 		}
-		if !strings.Contains(discovery.Plan.Accounts[0].DiscoveryReason, "aliases/version families/other retirement rules and identity additions are deferred") || len(discovery.Report.Discovery) == 0 || !strings.Contains(discovery.Report.Discovery[0].Reason, "newly observed IDs are not added") {
-			t.Fatalf("owner-only report does not explain deferred identity additions: plan=%#v report=%#v", discovery.Plan.Accounts[0], discovery.Report.Discovery)
+		if len(discovery.Report.Discovery) == 0 || !strings.Contains(discovery.Report.Discovery[0].Reason, "selector snapshot is authoritative") {
+			t.Fatalf("report did not explain selector authority over lifecycle documents: plan=%#v report=%#v", discovery.Plan.Accounts[0], discovery.Report.Discovery)
 		}
 		result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
 		if err != nil || len(result.AppliedIDs) != 1 || len(api.bulkCalls) != 1 {
 			t.Fatalf("owner-only removal did not apply: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
 		}
-		if _, exists := api.bulkMappings[0]["new-model"]; exists || !reflect.DeepEqual(api.bulkMappings[0], map[string]string{"stable": "stable"}) {
-			t.Fatalf("new live catalog ID was added during owner-only mode: %#v", api.bulkMappings[0])
+		if api.bulkMappings[0]["new-model"] != "new-model" || api.bulkMappings[0]["stable"] != "stable" {
+			t.Fatalf("officially selectable ID was not added: %#v", api.bulkMappings[0])
 		}
 	})
 
-	t.Run("04:10 manual-only stays blocked", func(t *testing.T) {
+	t.Run("manual-only also uses the official selector", func(t *testing.T) {
 		cfg, _, api, now := ownerAvailabilityWorkflowFixture(t, false, []string{"stable"})
 		cfg.RequireManualOnlyMode = true
 		api.status.Schedule = "04:00"
@@ -927,19 +971,24 @@ func TestOwnerAvailabilityExceptionDoesNotAllowLiveAdditionsOrManualOnlyApply(t 
 		api.status.Accounts[0].SourceProfileID = "manual_only"
 		api.status.Accounts[0].Status = "skipped"
 		discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, ManualOnlyOnly: true}).Discover(context.Background(), cfg)
-		if err != nil || discovery.Plan == nil || discovery.Plan.Accounts[0].ApplyEligible {
-			t.Fatalf("04:10 workflow received the full-screen exception: plan=%#v err=%v", discovery.Plan, err)
+		if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible {
+			t.Fatalf("fresh official selector was incorrectly blocked by lifecycle documents: plan=%#v err=%v", discovery.Plan, err)
 		}
 		result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, ManualOnlyOnly: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
-		if err == nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
-			t.Fatalf("04:10 workflow applied an owner-only removal without official evidence: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
+		if err != nil || len(result.AppliedIDs) != 1 || len(api.bulkCalls) != 1 {
+			t.Fatalf("manual-only selector-based removal did not apply: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
 		}
 	})
 }
 
 func ownerAvailabilityRulesFixture() catalog.Rules {
 	ids := []string{"gpt-5.2", "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-openai-compact"}
-	rules := catalog.Rules{SchemaVersion: 1, Aliases: []catalog.AliasRule{}, VersionFamilies: []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{}, SourceProfiles: []catalog.SourceProfile{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{}}
+	observed := time.Date(2026, 10, 10, 20, 10, 0, 0, time.UTC)
+	rules := catalog.Rules{
+		SchemaVersion: 1, Aliases: []catalog.AliasRule{}, VersionFamilies: []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{},
+		SourceProfiles: []catalog.SourceProfile{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
+		OfficialSelectability: []catalog.OfficialSelectability{{Scope: "official-account:test-owner-account", Complete: true, ModelIDs: []string{"stable", "upstream-known", "new-model"}, ObservedAt: observed, ExpiresAt: observed.Add(catalog.OfficialSelectabilityMaxAge), Evidence: "synthetic complete selector snapshot"}},
+	}
 	for _, id := range ids {
 		rules.OwnerLifecycleExclusions = append(rules.OwnerLifecycleExclusions, catalog.OwnerLifecycleExclusion{Scope: ownerAvailabilityScope, ModelID: id, Decision: "approved", Evidence: "owner-confirmed unavailable for the user's ordinary Codex sign-in", ReviewedAt: "2026-10-14"})
 	}
@@ -962,7 +1011,8 @@ func ownerAvailabilityWorkflowFixture(t *testing.T, fullScreen bool, liveModels 
 	rules := ownerAvailabilityRulesFixture()
 	rules.SourceProfiles = []catalog.SourceProfile{{
 		Source: source, BuildID: "test-build", APIContractID: config.APIContractAllAccountsV1, Decision: "approved",
-		LifecycleScopes: []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
+		OfficialSelectabilityScope: "official-account:test-owner-account",
+		LifecycleScopes:            []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
 		Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-14",
 	}}
 	writeWorkflowRules(t, cfg.RulesFile, rules)
@@ -1220,6 +1270,8 @@ func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
 	cfg.ApprovedRulesSHA256 = ""
 
 	rules := workflowRules(selected)
+	rules.OfficialSelectability[0].ObservedAt = now.UTC()
+	rules.OfficialSelectability[0].ExpiresAt = now.UTC().Add(catalog.OfficialSelectabilityMaxAge)
 	rules.Aliases = []catalog.AliasRule{}
 	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
 	rules.SourceProfiles[0].IdentityAddPolicy = "report_only"
@@ -1276,8 +1328,8 @@ func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
 		t.Fatalf("manual-only apply changed wrong accounts: result=%#v calls=%v", result, api.bulkCalls)
 	}
 	updated := api.accounts[selected.ID].ModelMapping
-	if updated["old-model"] != "" || updated["new-model"] != "new-model" || updated["still-live"] != "still-live" || updated["keep-alias"] != "provider-alias" {
-		t.Fatalf("selected account mapping was not synchronized safely: %#v", updated)
+	if updated["old-model"] != "old-model" || updated["new-model"] != "new-model" || updated["still-live"] != "still-live" || updated["keep-alias"] != "provider-alias" {
+		t.Fatalf("officially selectable models were not retained while the live catalog added a new route: %#v", updated)
 	}
 	if api.accounts[other.ID].ModelMapping["other-model"] != "other-model" || countCall(api.calls, "sync:8") != 0 {
 		t.Fatal("non-manual account was probed or modified")
@@ -1370,8 +1422,8 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(
 		t.Fatalf("full-screen applied unexpected accounts: result=%#v calls=%v", result, api.bulkCalls)
 	}
 	updated := api.accounts[selected.ID].ModelMapping
-	if updated["stale-model"] != "" || updated["new-model"] != "new-model" || updated["keep-model"] != "keep-model" {
-		t.Fatalf("approved exact identity sync did not reconcile mapping: %#v", updated)
+	if updated["stale-model"] != "stale-model" || updated["new-model"] != "new-model" || updated["keep-model"] != "keep-model" {
+		t.Fatalf("official selectability should retain stale-but-selectable IDs and add live selectable IDs: %#v", updated)
 	}
 	if api.accounts[unsupported.ID].ModelMapping["manual"] != "preserve" || countCall(api.calls, "status") != 2 {
 		t.Fatalf("full-screen changed an unsupported account or failed to check refresh again before write: calls=%v", api.calls)
@@ -1626,7 +1678,8 @@ func workflowRules(account adminapi.Account) catalog.Rules {
 	return catalog.Rules{
 		SchemaVersion:           1,
 		Aliases:                 []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "exact reviewed fixture", ReviewedAt: "2026-10-11"}},
-		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
+		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:test-openai-account", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
+		OfficialSelectability:   []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "canonical-name", "gpt-5.2", "gpt-5.2-pro", "gpt-5.4", "new-model", "model", "stable", "existing", "unreviewed", "unknown", "brand-new-opaque-id", "claude-haiku-4-5-20251001", "preferred", "snapshot", "canonical", "other", "keep", "keep-me", "still-live", "provider-alias", "old-model", "stale-model", "keep-model", "old"}, ObservedAt: time.Date(2026, 10, 10, 20, 10, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 10, 11, 20, 10, 0, 0, time.UTC), Evidence: "synthetic official account selector fixture"}},
 		CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 		VersionFamilies:         []catalog.VersionFamily{},
 		RetiredModels:           []catalog.RetiredRule{},

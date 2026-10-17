@@ -95,6 +95,119 @@ func TestAliasIsExactAndSourceScopedUnknownModelsRemainCandidates(t *testing.T) 
 	}
 }
 
+func TestOfficialAccountSelectabilityOverridesKeepAndRetirementRules(t *testing.T) {
+	source := sourceFixture()
+	now := time.Now().UTC().Truncate(time.Second)
+	rules := baseRules()
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"stable"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
+	rules.VersionFamilies = []VersionFamily{exactFamily(source, "gpt-5.2", "gpt-5.2", FamilyMember{UpstreamID: "gpt-5.2", ExactIDAction: "keep"})}
+	rules.RetiredModels = []RetiredRule{{Source: source, UpstreamID: "stable", PublicID: "stable", Decision: "approved", Evidence: "old lifecycle note says retired", ReviewedAt: now.Format("2006-01-02")}}
+	fingerprint := SourceFingerprint(source)
+	current := map[string]string{"gpt-5.2": "gpt-5.2", "stable": "stable"}
+	managed := map[string]state.ManagedMapping{
+		"gpt-5.2": {LastAppliedValue: "gpt-5.2", SourceFingerprint: fingerprint},
+		"stable":  {LastAppliedValue: "stable", SourceFingerprint: fingerprint},
+	}
+	plan, err := Normalize(rules, Input{AccountID: source.AccountID, Source: source, CurrentMapping: current, ManagedMappings: managed, LiveModels: []string{"gpt-5.2", "stable"}, LiveListAvailable: true, Completeness: CompletenessUnknown, RequireOfficialSelectability: true, OfficialSelectabilityScope: "official-account:openai-test-account", Now: now}, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+		t.Fatalf("complete current selector snapshot should produce an applicable plan: %#v", plan)
+	}
+	if _, exists := plan.After["gpt-5.2"]; exists {
+		t.Fatalf("static keep/upstream presence re-added an officially unavailable model: %#v", plan.After)
+	}
+	if plan.After["stable"] != "stable" {
+		t.Fatalf("static retirement overrode official selector availability: %#v", plan.After)
+	}
+	if len(plan.Changes) != 1 || plan.Changes[0].RuleKind != "official_selectability" {
+		t.Fatalf("expected only the selector-authorized removal, got %#v", plan.Changes)
+	}
+}
+
+func TestOfficialAccountSelectabilityMissingOrStaleBlocksAllChanges(t *testing.T) {
+	source := sourceFixture()
+	now := time.Now().UTC().Truncate(time.Second)
+	base := baseRules()
+	base.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	cases := []struct {
+		name  string
+		rules Rules
+	}{
+		{name: "missing snapshot", rules: base},
+		{name: "stale snapshot", rules: func() Rules {
+			rules := base
+			rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"new-model"}, ObservedAt: now.Add(-48 * time.Hour), ExpiresAt: now.Add(-24 * time.Hour), Evidence: "stale synthetic selector snapshot"}}
+			return rules
+		}()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			current := map[string]string{"old-model": "old-model"}
+			plan, err := Normalize(tc.rules, Input{AccountID: source.AccountID, Source: source, CurrentMapping: current, LiveModels: []string{"new-model"}, LiveListAvailable: true, Completeness: CompletenessUnknown, RequireOfficialSelectability: true, OfficialSelectabilityScope: "official-account:openai-test-account", Now: now}, state.Account{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.ApplyEligible || len(plan.Changes) != 0 || !reflect.DeepEqual(plan.After, current) || len(plan.Conflicts) == 0 {
+				t.Fatalf("missing/stale official selector snapshot did not fail closed: %#v", plan)
+			}
+		})
+	}
+}
+
+func TestOfficialAccountSelectabilityDoesNotClassifyWildcardRoutes(t *testing.T) {
+	source := sourceFixture()
+	now := time.Now().UTC().Truncate(time.Second)
+	rules := baseRules()
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"selected-model"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
+	fingerprint := SourceFingerprint(source)
+	current := map[string]string{"*": "*", "gpt-*": "gpt-*", "model?x": "model?x", "old-model": "old-model"}
+	managed := map[string]state.ManagedMapping{}
+	for key, value := range current {
+		managed[key] = state.ManagedMapping{LastAppliedValue: value, SourceFingerprint: fingerprint}
+	}
+	plan, err := Normalize(rules, Input{AccountID: source.AccountID, Source: source, CurrentMapping: current, ManagedMappings: managed, LiveModels: []string{"selected-model"}, LiveListAvailable: true, Completeness: CompletenessUnknown, RequireOfficialSelectability: true, OfficialSelectabilityScope: "official-account:openai-test-account", Now: now}, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+		t.Fatalf("wildcard routes should not make selector reconciliation ineligible: %#v", plan)
+	}
+	for _, wildcard := range []string{"*", "gpt-*", "model?x"} {
+		if got := plan.After[wildcard]; got != wildcard {
+			t.Errorf("wildcard route %q was changed by a concrete account selector: got %q", wildcard, got)
+		}
+	}
+	if _, exists := plan.After["old-model"]; exists {
+		t.Fatal("concrete unavailable model was retained")
+	}
+	if len(plan.Changes) != 1 || plan.Changes[0].PublicID != "old-model" {
+		t.Fatalf("expected only concrete unavailable model removal, got %#v", plan.Changes)
+	}
+}
+
+func TestOfficialSelectabilityRequiresAccountIdentityAlias(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	source := sourceFixture()
+	for _, scope := range []string{"openai_codex_chatgpt_login", "", "official-account:", "official-account:openai account"} {
+		rules := baseRules()
+		rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: scope, Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+		rules.OfficialSelectability = []OfficialSelectability{{Scope: scope, Complete: true, ModelIDs: []string{"selected-model"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "complete official selector snapshot"}}
+		if err := rules.Validate(); err == nil {
+			t.Errorf("non-account-specific selector scope %q was accepted", scope)
+		}
+	}
+	rules := baseRules()
+	rules.SourceProfiles = []SourceProfile{{Source: source, BuildID: "build-1", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:openai-test-account", Evidence: "synthetic source profile", ReviewedAt: now.Format("2006-01-02")}}
+	rules.OfficialSelectability = []OfficialSelectability{{Scope: "official-account:openai-test-account", Complete: true, ModelIDs: []string{"*"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "invalid wildcard selector fixture"}}
+	if err := rules.Validate(); err == nil {
+		t.Fatal("wildcard routing patterns were accepted as official selectable model IDs")
+	}
+}
+
 func TestOrdinaryNormalizationRejectsWildcardVersionFamilyAccountScope(t *testing.T) {
 	s := sourceFixture()
 	wildcardAccountSource := s
