@@ -124,6 +124,7 @@ func resolveInsufficientEvidence(ctx context.Context, client AdminAPI, plans []c
 		// Only unresolved official evidence is probed. A fresh official negative
 		// remains authoritative; account probes resolve insufficient evidence.
 		decision := catalog.ModelProbeDecision{Provider: scope.provider, ModelID: scope.modelID, Status: "unavailable", Accounts: make([]catalog.ModelProbeOutcome, 0, len(accountIDs))}
+		officialAvailableInScope := false
 		for _, row := range rows {
 			if row.Status == "skipped_inactive" || row.Status == "skipped_shadow" {
 				continue
@@ -149,6 +150,9 @@ func resolveInsufficientEvidence(ctx context.Context, client AdminAPI, plans []c
 					}
 				}
 				decision.ScopeAccounts = append(decision.ScopeAccounts, catalog.ModelProbeScopeAccount{AccountID: row.ID, Reason: reason})
+				if reason == "official_available" {
+					officialAvailableInScope = true
+				}
 				break
 			}
 		}
@@ -173,6 +177,12 @@ func resolveInsufficientEvidence(ctx context.Context, client AdminAPI, plans []c
 			}
 		}
 		if decision.Status != "available" && incomplete {
+			decision.Status = "ignored"
+		}
+		if decision.Status != "available" && officialAvailableInScope {
+			// A positive official exact-ID result is outside the relay probe set,
+			// so failures on only the remaining accounts cannot prove a global
+			// negative or create a cascade floor.
 			decision.Status = "ignored"
 		}
 		decisions = append(decisions, decision)
@@ -262,8 +272,43 @@ func applyModelProbeEvidence(plan *catalog.Plan, decision catalog.ModelProbeDeci
 	if !changed {
 		return errors.New("model-probe evidence does not match the account plan")
 	}
+	catalog.CascadeUnavailableVersions(plan.ProductAvailability)
 	plan.ProductAvailabilitySHA256, err = catalog.ProductAvailabilityDigest(plan.ProductAvailability)
 	return err
+}
+
+func applyGlobalProbeVersionFloors(items []catalog.ProductModelAvailability, decisions []catalog.ModelProbeDecision, retrievedAt time.Time) (bool, error) {
+	combined := append([]catalog.ProductModelAvailability{}, items...)
+	for _, decision := range decisions {
+		if decision.Status != "unavailable" {
+			continue
+		}
+		digest, err := modelProbeDecisionDigest(decision)
+		if err != nil {
+			return false, err
+		}
+		combined = append(combined, catalog.ProductModelAvailability{
+			ModelID: decision.ModelID, Provider: decision.Provider, Status: "unavailable", MatchKind: "all_account_probes_failed",
+			SourceIDs: []string{accountProbeSourceID}, SourceURLs: []string{accountProbeSourceURL}, ContentSHA256: []string{digest}, RetrievedAt: retrievedAt.UTC(),
+		})
+	}
+	catalog.CascadeUnavailableVersions(combined)
+	changed := false
+	for _, cascaded := range combined {
+		if cascaded.MatchKind != "lower_than_unavailable_version" {
+			continue
+		}
+		for i := range items {
+			if items[i].ModelID != cascaded.ModelID || items[i].Provider != cascaded.Provider {
+				continue
+			}
+			if items[i].Status != cascaded.Status || items[i].MatchKind != cascaded.MatchKind || items[i].VersionFloorModelID != cascaded.VersionFloorModelID {
+				items[i] = cascaded
+				changed = true
+			}
+		}
+	}
+	return changed, nil
 }
 
 // DiscoveryPreflight contains the exact validated local rules/state snapshots
@@ -776,8 +821,10 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 					ModelID: evidence.ModelID, Provider: evidence.Provider, Status: evidence.Status, MatchKind: evidence.MatchKind,
 					SourceIDs: append([]string(nil), evidence.SourceIDs...), SourceURLs: append([]string(nil), evidence.SourceURLs...),
 					ContentSHA256: append([]string(nil), evidence.ContentSHA256...), RetrievedAt: evidence.RetrievedAt,
+					VersionFloorModelID: evidence.VersionFloorModelID,
 				})
 			}
+			catalog.CascadeUnavailableVersions(productAvailability)
 		}
 		plan, err := catalog.Normalize(rules, catalog.Input{
 			AccountID: account.ID, Source: source, SourceIdentityAddPolicy: identityAddPolicy,
@@ -854,6 +901,14 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 						break
 					}
 				}
+				// Probe results are aggregated across all accounts. Use those global
+				// negative decisions as candidate floors even when this particular
+				// account does not itself map the higher version.
+				cascaded, cascadeErr := applyGlobalProbeVersionFloors(p.ProductAvailability, decisions, now())
+				if cascadeErr != nil {
+					return result, cascadeErr
+				}
+				changed = changed || cascaded
 				if !changed {
 					continue
 				}

@@ -2075,6 +2075,68 @@ func TestResolveInsufficientEvidenceRequiresEveryRelevantAccountToFail(t *testin
 	}
 }
 
+func TestUnavailableProbeCascadesToLowerMappedVersion(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	plan := catalog.Plan{ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{
+		{ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"},
+	}}
+	decision := catalog.ModelProbeDecision{Provider: "openai", ModelID: "gpt-5.5", Status: "unavailable", Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}}}
+	if err := applyModelProbeEvidence(&plan, decision, when); err != nil {
+		t.Fatalf("failed probe did not cascade: %v", err)
+	}
+	if got := plan.ProductAvailability[0]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("lower GPT version was not marked unavailable: %+v", got)
+	}
+	if _, err := catalog.ProductAvailabilityDigest(plan.ProductAvailability); err != nil {
+		t.Fatalf("cascaded evidence is not digestible/valid: %v", err)
+	}
+}
+
+func TestGlobalUnavailableProbeCascadesAcrossAccountPlans(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	otherAccountAvailability := []catalog.ProductModelAvailability{{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact",
+		SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"},
+		ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when,
+	}}
+	decisions := []catalog.ModelProbeDecision{{
+		Provider: "openai", ModelID: "gpt-5.5", Status: "unavailable",
+		Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}, {AccountID: 9, Outcome: "failed"}},
+	}}
+	changed, err := applyGlobalProbeVersionFloors(otherAccountAvailability, decisions, when)
+	if err != nil || !changed {
+		t.Fatalf("global higher-version failure did not propagate: changed=%t err=%v", changed, err)
+	}
+	got := otherAccountAvailability[0]
+	if got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("lower version on another account did not inherit global failure: %+v", got)
+	}
+	if _, err := catalog.ProductAvailabilityDigest(otherAccountAvailability); err != nil {
+		t.Fatalf("globally cascaded evidence is not valid: %v", err)
+	}
+}
+
+func TestOfficialPositiveScopePreventsProbeFailureFromBecomingGlobalFloor(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+	}
+	rows := []report.DiscoveryAccount{
+		{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}},
+		{ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}},
+	}
+	api := &workflowAPI{probeOutcomes: map[string]string{"gpt-5.5": "failed"}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil || len(decisions) != 1 || decisions[0].Status != "ignored" {
+		t.Fatalf("failed probes overrode a positive exact-ID account scope: decisions=%+v err=%v", decisions, err)
+	}
+	if _, err := catalog.ModelProbeDigest(decisions); err != nil {
+		t.Fatalf("ignored mixed official/probe evidence was not digestible: %v", err)
+	}
+}
+
 func TestResolveInsufficientEvidenceSeparatesProvidersWithSameModelID(t *testing.T) {
 	plans := []catalog.Plan{
 		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "shared-id", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"a": "shared-id"}},

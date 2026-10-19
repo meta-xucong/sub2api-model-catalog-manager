@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"sub2api-model-catalog-manager/internal/modelversion"
 	"sub2api-model-catalog-manager/internal/state"
 )
 
@@ -65,14 +66,15 @@ type LifecycleExclusion struct {
 // product evidence, and the absence of such evidence, cannot change between
 // discovery and apply without changing the plan hash.
 type ProductModelAvailability struct {
-	ModelID       string    `json:"model_id"`
-	Provider      string    `json:"provider,omitempty"`
-	Status        string    `json:"status"`
-	MatchKind     string    `json:"match_kind"`
-	SourceIDs     []string  `json:"source_ids,omitempty"`
-	SourceURLs    []string  `json:"source_urls,omitempty"`
-	ContentSHA256 []string  `json:"content_sha256,omitempty"`
-	RetrievedAt   time.Time `json:"retrieved_at,omitempty"`
+	ModelID             string    `json:"model_id"`
+	Provider            string    `json:"provider,omitempty"`
+	Status              string    `json:"status"`
+	MatchKind           string    `json:"match_kind"`
+	VersionFloorModelID string    `json:"version_floor_model_id,omitempty"`
+	SourceIDs           []string  `json:"source_ids,omitempty"`
+	SourceURLs          []string  `json:"source_urls,omitempty"`
+	ContentSHA256       []string  `json:"content_sha256,omitempty"`
+	RetrievedAt         time.Time `json:"retrieved_at,omitempty"`
 }
 
 var (
@@ -1196,7 +1198,7 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 	if item.Status != "available" && item.Status != "unavailable" && item.Status != "insufficient_evidence" {
 		return errors.New("product availability contains an invalid status")
 	}
-	if item.MatchKind != "exact" && item.MatchKind != "explicit_alias" && item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "account_probe_success" && item.MatchKind != "all_account_probes_failed" && item.MatchKind != "account_probe_ignored" && item.MatchKind != "none" {
+	if item.MatchKind != "exact" && item.MatchKind != "explicit_alias" && item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "account_probe_success" && item.MatchKind != "all_account_probes_failed" && item.MatchKind != "account_probe_ignored" && item.MatchKind != "lower_than_unavailable_version" && item.MatchKind != "none" {
 		return errors.New("product availability contains an invalid match kind")
 	}
 	if item.Status == "available" {
@@ -1204,7 +1206,7 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 			return errors.New("positive product availability is missing exact source evidence")
 		}
 	} else if item.Status == "unavailable" {
-		if item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "all_account_probes_failed" || len(item.SourceIDs) == 0 || len(item.SourceURLs) == 0 || len(item.ContentSHA256) == 0 || item.RetrievedAt.IsZero() {
+		if item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "all_account_probes_failed" && item.MatchKind != "lower_than_unavailable_version" || len(item.SourceIDs) == 0 || len(item.SourceURLs) == 0 || len(item.ContentSHA256) == 0 || item.RetrievedAt.IsZero() {
 			return errors.New("negative product availability is missing complete-scope evidence")
 		}
 	} else if item.MatchKind != "none" && item.MatchKind != "account_probe_ignored" {
@@ -1235,6 +1237,13 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 			return errors.New("product retirement evidence is not bound to the approved OpenAI cross-product lifecycle source")
 		}
 	}
+	if item.MatchKind == "lower_than_unavailable_version" {
+		if item.VersionFloorModelID == "" || !modelversion.LowerVersion(item.ModelID, item.VersionFloorModelID) || !validVersionFloorSource(item) {
+			return errors.New("cascaded version-floor evidence does not identify a newer unavailable model in the same family")
+		}
+	} else if item.VersionFloorModelID != "" {
+		return errors.New("version-floor trigger is only valid for cascaded unavailability")
+	}
 	for i, sourceID := range item.SourceIDs {
 		if strings.TrimSpace(sourceID) == "" || !strings.HasPrefix(item.SourceURLs[i], "https://") || !validSHA256(item.ContentSHA256[i]) || (i > 0 && item.SourceIDs[i-1] >= sourceID) {
 			return errors.New("product availability source metadata is invalid or not canonical")
@@ -1255,7 +1264,7 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 
 func authorizesUnmanagedProductRemoval(item ProductModelAvailability) bool {
 	switch item.MatchKind {
-	case "accepted_union_version_floor", "accepted_union_retirement", "all_account_probes_failed":
+	case "accepted_union_version_floor", "accepted_union_retirement", "all_account_probes_failed", "lower_than_unavailable_version":
 		return validateProductModelAvailability(item) == nil
 	default:
 		return false

@@ -592,6 +592,9 @@ func TestLifecycleScopeFreshnessAndNearRetirementBoundaries(t *testing.T) {
 	if byID["gpt-5.5"].Status != "unavailable" || byID["gpt-5.5"].MatchKind != "accepted_union_retirement" {
 		t.Errorf("explicit cross-product retirement should remove gpt-5.5 from the accepted union: %+v", byID["gpt-5.5"])
 	}
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "lower_than_unavailable_version" || byID["gpt-5.4"].VersionFloorModelID != "gpt-5.5" {
+		t.Errorf("lower GPT versions should inherit the explicit GPT-5.5 retirement: %+v", byID["gpt-5.4"])
+	}
 	// Prove the new accepted-union source alone suppresses a conflicting Codex
 	// positive. The same-surface Codex retirement must not mask a broken union path.
 	unionOnly := base
@@ -790,8 +793,8 @@ func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
 	for _, item := range ids {
 		byID[item.ModelID] = item
 	}
-	if byID["gpt-5.4"].Status != "insufficient_evidence" || byID["gpt-5.4"].MatchKind != "none" || byID["gpt-5.5"].Status != "unavailable" {
-		t.Fatalf("Codex-only absence must remain insufficient for the ChatGPT web + Codex union while cross-product retirement is decisive: %+v", ids)
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-4o-audio-preview"].Status != "insufficient_evidence" || byID["gpt-5.5"].Status != "unavailable" {
+		t.Fatalf("explicit cross-product retirement must cascade to lower GPT versions while unrelated specialized IDs remain insufficient: %+v", ids)
 	}
 	if byID["gpt-4o-audio-preview"].Status != "insufficient_evidence" {
 		t.Fatalf("specialized product IDs must remain unknown without complete union evidence: %+v", byID["gpt-4o-audio-preview"])
@@ -815,8 +818,8 @@ func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
 	if byID["gpt-4o-audio-preview"].Status != "unavailable" || byID["gpt-4o-audio-preview"].MatchKind != "accepted_union_absence" {
 		t.Fatalf("only an audited complete accepted-union catalog can establish absence for specialized model families: %+v", byID["gpt-4o-audio-preview"])
 	}
-	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_absence" {
-		t.Fatalf("only an explicitly complete accepted-union catalog should establish GPT absence: %+v", byID["gpt-5.4"])
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "lower_than_unavailable_version" || byID["gpt-5.4"].VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("the hard retirement rule should classify lower GPT versions as cascaded negatives: %+v", byID["gpt-5.4"])
 	}
 	if byID["gpt-5.5"].Status != "unavailable" || byID["gpt-5.5"].MatchKind != "accepted_union_retirement" {
 		t.Fatalf("only an audited accepted-union lifecycle source can establish retirement: %+v", byID["gpt-5.5"])
@@ -826,6 +829,13 @@ func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
 func TestGPTCodexFloorDoesNotImplyChatGPTUnionAbsence(t *testing.T) {
 	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
 	openAI := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, false)
+	withoutRetirement := openAI.Providers[:0]
+	for _, provider := range openAI.Providers {
+		if provider.SourceID != "openai-cross-product-lifecycle-v2" {
+			withoutRetirement = append(withoutRetirement, provider)
+		}
+	}
+	openAI.Providers = withoutRetirement
 	openAIAvailability := EvaluateProductAvailability(openAI, []string{
 		"gpt-5.2", "gpt-5.4", "gpt-5.5-openai-compact", "gpt-5.6",
 	}, now)

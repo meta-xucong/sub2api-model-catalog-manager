@@ -256,14 +256,15 @@ type AvailableModelCatalog struct {
 // permits a model ID to enter an automatic identity mapping. A missing ID on
 // an incomplete page is insufficient evidence, never a negative decision.
 type ProductModelAvailability struct {
-	ModelID       string    `json:"model_id"`
-	Provider      string    `json:"provider,omitempty"`
-	Status        string    `json:"status"`
-	MatchKind     string    `json:"match_kind"`
-	SourceIDs     []string  `json:"source_ids,omitempty"`
-	SourceURLs    []string  `json:"source_urls,omitempty"`
-	ContentSHA256 []string  `json:"content_sha256,omitempty"`
-	RetrievedAt   time.Time `json:"retrieved_at,omitempty"`
+	ModelID             string    `json:"model_id"`
+	Provider            string    `json:"provider,omitempty"`
+	Status              string    `json:"status"`
+	MatchKind           string    `json:"match_kind"`
+	VersionFloorModelID string    `json:"version_floor_model_id,omitempty"`
+	SourceIDs           []string  `json:"source_ids,omitempty"`
+	SourceURLs          []string  `json:"source_urls,omitempty"`
+	ContentSHA256       []string  `json:"content_sha256,omitempty"`
+	RetrievedAt         time.Time `json:"retrieved_at,omitempty"`
 }
 
 type NameShapeCandidate struct {

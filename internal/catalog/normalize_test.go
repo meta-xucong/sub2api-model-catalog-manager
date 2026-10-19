@@ -86,6 +86,18 @@ func TestVersionFloorEvidenceIsBoundToApprovedOfficialCatalogs(t *testing.T) {
 	if err := validateProductModelAvailability(retirement); err != nil {
 		t.Fatalf("approved OpenAI cross-product retirement evidence was rejected: %v", err)
 	}
+	cascaded := ProductModelAvailability{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "unavailable", MatchKind: "lower_than_unavailable_version",
+		VersionFloorModelID: "gpt-5.5", SourceIDs: retirement.SourceIDs, SourceURLs: retirement.SourceURLs,
+		ContentSHA256: retirement.ContentSHA256, RetrievedAt: retirement.RetrievedAt,
+	}
+	if err := validateProductModelAvailability(cascaded); err != nil {
+		t.Fatalf("valid cascaded evidence was rejected: %v", err)
+	}
+	cascaded.VersionFloorModelID = "claude-opus-4-6"
+	if err := validateProductModelAvailability(cascaded); err == nil {
+		t.Fatal("cross-family cascade evidence was accepted")
+	}
 	for _, tc := range []struct {
 		name string
 		edit func(*ProductModelAvailability)
@@ -101,6 +113,60 @@ func TestVersionFloorEvidenceIsBoundToApprovedOfficialCatalogs(t *testing.T) {
 		tc.edit(&item)
 		if err := validateProductModelAvailability(item); err == nil {
 			t.Errorf("%s retirement evidence was accepted", tc.name)
+		}
+	}
+}
+
+func TestCascadeUnavailableVersionsHardRule(t *testing.T) {
+	when := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	floor := ProductModelAvailability{
+		ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement",
+		SourceIDs: []string{"openai-cross-product-lifecycle-v2"}, SourceURLs: []string{"https://learn.chatgpt.com/docs/changelog"},
+		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when,
+	}
+	items := []ProductModelAvailability{
+		{ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement", SourceIDs: floor.SourceIDs, SourceURLs: floor.SourceURLs, ContentSHA256: floor.ContentSHA256, RetrievedAt: when},
+		{ModelID: "gpt-image-1.5", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when},
+		{ModelID: "claude-opus-4-5", Provider: "anthropic", Status: "available", MatchKind: "exact", SourceIDs: []string{"anthropic-models"}, SourceURLs: []string{"https://www.anthropic.com/models"}, ContentSHA256: []string{strings.Repeat("d", 64)}, RetrievedAt: when},
+		{ModelID: "claude-sonnet-4-5", Provider: "anthropic", Status: "available", MatchKind: "exact", SourceIDs: []string{"anthropic-models"}, SourceURLs: []string{"https://www.anthropic.com/models"}, ContentSHA256: []string{strings.Repeat("e", 64)}, RetrievedAt: when},
+		{ModelID: "claude-sonnet-4-6", Provider: "anthropic", Status: "unavailable", MatchKind: "all_account_probes_failed", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("f", 64)}, RetrievedAt: when},
+	}
+	CascadeUnavailableVersions(items)
+	byID := map[string]ProductModelAvailability{}
+	for _, item := range items {
+		byID[item.ModelID] = item
+	}
+	if got := byID["gpt-5.4"]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("lower GPT version was not cascaded: %+v", got)
+	}
+	if byID["gpt-image-1.5"].Status != "available" || byID["claude-opus-4-5"].Status != "available" {
+		t.Fatal("cascade crossed a model family/provider boundary")
+	}
+	if got := byID["claude-sonnet-4-5"]; got.Status != "unavailable" || got.VersionFloorModelID != "claude-sonnet-4-6" {
+		t.Fatalf("same-provider Claude Sonnet floor did not cascade independently of Opus: %+v", got)
+	}
+}
+
+func TestCascadeUsesBoundProviderCatalogAbsence(t *testing.T) {
+	when := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	items := []ProductModelAvailability{
+		{ModelID: "doubao-seed-2-0-lite", Provider: "volcengine", Status: "available", MatchKind: "exact", SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when},
+		{ModelID: "doubao-seed-1-5-pro", Provider: "volcengine", Status: "unavailable", MatchKind: "official_account_absence", SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when},
+		{ModelID: "doubao-seed-2-1-pro", Provider: "volcengine", Status: "unavailable", MatchKind: "official_account_absence", SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"}, ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when},
+	}
+	CascadeUnavailableVersions(items)
+	byID := map[string]ProductModelAvailability{}
+	for _, item := range items {
+		byID[item.ModelID] = item
+	}
+	for _, id := range []string{"doubao-seed-2-0-lite", "doubao-seed-1-5-pro"} {
+		got := byID[id]
+		if got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "doubao-seed-2-1-pro" {
+			t.Fatalf("Ark version floor did not cascade to lower Volcengine model %s: %+v", id, got)
+		}
+		if err := validateProductModelAvailability(got); err != nil {
+			t.Fatalf("Ark cascaded evidence for %s failed validation: %v", id, err)
 		}
 	}
 }

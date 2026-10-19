@@ -120,3 +120,32 @@ Acceptance also requires focused tests, `go test ./... -count=1`, `git diff --ch
 - Commit `29c38e7a6927fe32e84fdc5d50f6992b1acf83c7` was pushed to `origin/codex/official-selectability-auto-sync`. The Linux amd64 build SHA-256 is `4f2cbbe34bcd7c86d52a7e1a0f52d98c2888e4828c22ee4188552118c253508d`.
 - That exact binary was atomically installed at `/opt/codex-usb-license-revocation/model-catalog-manager` on the Philippines jump VPS. The previous binary is preserved at `/var/backups/codex-usb-license-revocation/deploy-20261019T154402Z/model-catalog-manager` with SHA-256 `415844e8f296cde9be7fa1e5538e2a34008209bf6eb22f4253aab5aa4965206e`. The installed hash matches the local build and the license service remains active.
 - Deployment did not restart the license service, run a screening cycle, or apply mappings. This change has not yet had a post-deployment screening run. The Linux build, `gofmt`, `git diff --check`, and independent read-only audit passed; Go tests were not run for this change.
+
+## 2026-10-20 Hard lower-version retirement rule
+
+The owner requires a confirmed unavailable model version to retire every
+recognized lower version in the same model family. This is a hard screening
+rule: it applies to fresh accepted official union retirement/version-floor
+evidence, a complete configured Ark/Bailian model catalog negative, and to an
+`unavailable` result after every relevant 404token account probe failed. It
+applies across account plans, including when the higher model
+is mapped in one account and a lower version is mapped in another. A lower
+version that had positive evidence is still overridden by this rule. The
+generated approval plan records `lower_than_unavailable_version` and the exact
+`version_floor_model_id`, and carries forward the trigger's source IDs, URLs,
+content hashes, and retrieval time. The approval-plan validator requires that
+the exact higher-version trigger also exists as a validated direct negative in
+the same all-account screening plan, either in product evidence or as an
+unavailable global probe decision. If any exact-model scope has positive
+official product evidence, failures from only the remaining probe accounts are
+ignored and do not create a global version floor.
+
+Only strictly numeric version ordering within an explicitly recognized family
+is used. GPT text IDs are separate from GPT Image; Claude Opus, Sonnet, Haiku,
+and Fable are separate families. Grok, GLM, DeepSeek, Qwen, Doubao Seed,
+MiniMax M-series, and Kimi K-series (including the official bare `kN` aliases)
+are recognized independently. GPT Codex Spark is not numerically compared to
+base GPT versions. Unknown or ambiguous ID shapes, different families, and statuses such as
+`insufficient_evidence` or `ignored` never cascade. This rule authorizes
+unmanaged mapping removal only after the trigger itself has passed the existing
+validated negative-evidence contract.

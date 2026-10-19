@@ -89,6 +89,7 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 	}
 	seen := map[int64]bool{}
 	probeParticipants := map[string]map[int64]string{}
+	cascadedAvailability := map[string][]ProductModelAvailability{}
 	for _, account := range p.Accounts {
 		if account.AccountID <= 0 || seen[account.AccountID] || account.Before == nil || account.After == nil || account.AbsenceCountsBefore == nil || account.AbsenceCountsAfter == nil || !validAbsenceCounts(account.AbsenceCountsBefore) || !validAbsenceCounts(account.AbsenceCountsAfter) || account.Conflicts == nil || account.CatalogObservedAt.IsZero() || !validSHA256(account.DirectoryHash) || !validSHA256(account.SourceFingerprint) || !validSHA256(account.LifecycleEvidenceSHA256) || (account.OfficialSelectabilitySHA256 == "" && (!account.OfficialSelectabilityObservedAt.IsZero() || !account.OfficialSelectabilityExpiresAt.IsZero() || account.OfficialSelectabilityScope != "")) || (account.OfficialSelectabilitySHA256 != "" && (!validOfficialSelectabilityScope(account.OfficialSelectabilityScope) || !validSHA256(account.OfficialSelectabilitySHA256) || account.OfficialSelectabilityObservedAt.IsZero() || account.OfficialSelectabilityExpiresAt.IsZero())) || (account.OfficialSelectabilityObservedAt.IsZero() != account.OfficialSelectabilityExpiresAt.IsZero()) || (!account.OfficialSelectabilityObservedAt.IsZero() && (!account.OfficialSelectabilityExpiresAt.After(account.OfficialSelectabilityObservedAt) || account.OfficialSelectabilityExpiresAt.Sub(account.OfficialSelectabilityObservedAt) > OfficialSelectabilityMaxAge)) || (account.IdentityCatalogPolicy != "" && account.IdentityCatalogPolicy != "replace_identity_from_live_list" && account.IdentityCatalogPolicy != "add_identity_from_live_list") {
 			return errors.New("approval plan contains an invalid account snapshot")
@@ -116,6 +117,10 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			return errors.New("approval plan contains product availability evidence without enforcement")
 		}
 		for _, evidence := range account.ProductAvailability {
+			if evidence.MatchKind == "lower_than_unavailable_version" {
+				key := ModelProbeKey(evidence.Provider, evidence.ModelID)
+				cascadedAvailability[key] = append(cascadedAvailability[key], evidence)
+			}
 			if evidence.MatchKind != "account_probe_success" && evidence.MatchKind != "all_account_probes_failed" && evidence.MatchKind != "account_probe_ignored" {
 				continue
 			}
@@ -157,16 +162,23 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			return errors.New("approval plan after mapping is invalid")
 		}
 	}
-	if len(probeParticipants) != len(p.ModelProbeDecisions) {
+	if len(probeParticipants) != nonCascadedProbeDecisionCount(p.ModelProbeDecisions, cascadedAvailability) {
 		return errors.New("approval plan model-probe decisions do not match account evidence")
 	}
 	for _, decision := range p.ModelProbeDecisions {
 		key := ModelProbeKey(decision.Provider, decision.ModelID)
 		participants := probeParticipants[key]
-		if len(participants) != len(decision.Accounts) {
+		if len(cascadedAvailability[key]) > 0 {
+			if !hasValidatedVersionFloorProof(p, cascadedAvailability[key]) {
+				return errors.New("cascaded model-probe evidence has no matching unavailable higher-version proof")
+			}
+		} else if len(participants) != len(decision.Accounts) {
 			return errors.New("approval plan model-probe account scope is incomplete")
 		}
 		for _, outcome := range decision.Accounts {
+			if len(cascadedAvailability[key]) > 0 {
+				continue // A newer unavailable version overrides this model's independent probe outcome.
+			}
 			status, found := participants[outcome.AccountID]
 			if !found {
 				return errors.New("approval plan model-probe account scope does not match the participating account plans")
@@ -182,8 +194,10 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			}
 			seenScope[scope.AccountID] = true
 			if scope.Reason == "probe" {
-				if _, ok := participants[scope.AccountID]; !ok {
-					return errors.New("model-probe scope does not match participating accounts")
+				if len(cascadedAvailability[key]) == 0 {
+					if _, ok := participants[scope.AccountID]; !ok {
+						return errors.New("model-probe scope does not match participating accounts")
+					}
 				}
 			} else if scope.Reason != "official_available" && scope.Reason != "official_unavailable" && scope.Reason != "other_provider" {
 				return errors.New("approval plan model-probe scope reason is invalid")
@@ -211,6 +225,10 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			if match == nil {
 				continue
 			}
+			if match.MatchKind == "lower_than_unavailable_version" {
+				expectedScope[account.AccountID] = "cascade"
+				continue
+			}
 			if match.Provider != decision.Provider {
 				expectedScope[account.AccountID] = "other_provider"
 				continue
@@ -232,12 +250,102 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			return errors.New("model-probe scope manifest does not match exact-model account plans")
 		}
 		for _, scope := range decision.ScopeAccounts {
-			if expectedScope[scope.AccountID] != scope.Reason {
+			if expectedScope[scope.AccountID] != "cascade" && expectedScope[scope.AccountID] != scope.Reason {
 				return errors.New("model-probe scope manifest disagrees with account evidence")
 			}
 		}
 	}
+	for _, account := range p.Accounts {
+		for _, evidence := range account.ProductAvailability {
+			if evidence.MatchKind == "lower_than_unavailable_version" && !hasValidatedVersionFloorProof(p, []ProductModelAvailability{evidence}) {
+				return errors.New("cascaded product availability has no matching unavailable higher-version proof")
+			}
+		}
+	}
 	return nil
+}
+
+func nonCascadedProbeDecisionCount(decisions []ModelProbeDecision, cascaded map[string][]ProductModelAvailability) int {
+	count := 0
+	for _, decision := range decisions {
+		if len(cascaded[ModelProbeKey(decision.Provider, decision.ModelID)]) == 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func hasValidatedVersionFloorProof(plan ApprovalPlan, cascaded []ProductModelAvailability) bool {
+	for _, item := range cascaded {
+		found := false
+		for _, account := range plan.Accounts {
+			for _, trigger := range account.ProductAvailability {
+				validTrigger := canEstablishVersionFloor(trigger)
+				if trigger.MatchKind == "all_account_probes_failed" {
+					validTrigger = modelProbeEvidenceMatchesDecision(plan, trigger)
+				}
+				if trigger.ModelID == item.VersionFloorModelID && trigger.Provider == item.Provider && trigger.Status == "unavailable" &&
+					trigger.MatchKind != "lower_than_unavailable_version" && validTrigger &&
+					stringSliceEqual(trigger.SourceIDs, item.SourceIDs) && stringSliceEqual(trigger.SourceURLs, item.SourceURLs) && stringSliceEqual(trigger.ContentSHA256, item.ContentSHA256) {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			for _, decision := range plan.ModelProbeDecisions {
+				if decision.Provider != item.Provider || decision.ModelID != item.VersionFloorModelID || decision.Status != "unavailable" {
+					continue
+				}
+				if modelProbeEvidenceMatchesDecision(plan, ProductModelAvailability{
+					ModelID: item.VersionFloorModelID, Provider: item.Provider, Status: "unavailable", MatchKind: "all_account_probes_failed",
+					SourceIDs: item.SourceIDs, SourceURLs: item.SourceURLs, ContentSHA256: item.ContentSHA256,
+				}) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return len(cascaded) > 0
+}
+
+func modelProbeEvidenceMatchesDecision(plan ApprovalPlan, evidence ProductModelAvailability) bool {
+	if evidence.MatchKind != "all_account_probes_failed" || evidence.Status != "unavailable" || len(evidence.SourceIDs) != 1 || evidence.SourceIDs[0] != "404token-account-probe-v1" || len(evidence.SourceURLs) != 1 || evidence.SourceURLs[0] != "https://404token.xyz/api/v1/admin/accounts/{account_id}/test" || len(evidence.ContentSHA256) != 1 {
+		return false
+	}
+	for _, decision := range plan.ModelProbeDecisions {
+		if decision.Provider != evidence.Provider || decision.ModelID != evidence.ModelID || decision.Status != "unavailable" {
+			continue
+		}
+		body, err := json.Marshal(decision)
+		if err != nil {
+			continue
+		}
+		h := sha256.Sum256(body)
+		if evidence.ContentSHA256[0] == hex.EncodeToString(h[:]) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func ModelProbeDigest(decisions []ModelProbeDecision) (string, error) {
@@ -260,6 +368,13 @@ func ModelProbeDigest(decisions []ModelProbeDecision) (string, error) {
 		succeeded := false
 		failed := 0
 		incomplete := 0
+		officialAvailableInScope := false
+		for _, scope := range decision.ScopeAccounts {
+			if scope.Reason == "official_available" {
+				officialAvailableInScope = true
+				break
+			}
+		}
 		previousID := int64(0)
 		seenSuccess := false
 		for _, account := range decision.Accounts {
@@ -292,7 +407,7 @@ func ModelProbeDigest(decisions []ModelProbeDecision) (string, error) {
 				return "", errors.New("model-probe account outcome is invalid")
 			}
 		}
-		if decision.Status == "available" && !succeeded || decision.Status == "unavailable" && (succeeded || incomplete != 0 || failed != len(decision.Accounts)) || decision.Status == "ignored" && (succeeded || incomplete == 0) {
+		if decision.Status == "available" && !succeeded || decision.Status == "unavailable" && (succeeded || incomplete != 0 || failed != len(decision.Accounts) || officialAvailableInScope) || decision.Status == "ignored" && (succeeded || incomplete == 0 && !officialAvailableInScope) {
 			return "", errors.New("model-probe aggregate does not match account outcomes")
 		}
 	}

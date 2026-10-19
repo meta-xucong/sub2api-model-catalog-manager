@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sub2api-model-catalog-manager/internal/modelversion"
 )
 
 const MaxLifecycleCacheAge = 7 * 24 * time.Hour
@@ -249,6 +251,15 @@ func EvaluateProductAvailability(syncResult StartupSyncResult, modelIDs []string
 		bySource[result.SourceID] = result
 	}
 	ids := uniqueProductModelIDs(modelIDs)
+	// Include exact accepted-union retirement subjects even if the candidate
+	// inventory no longer contains the higher ID. Their negative evidence is
+	// the version-floor proof for lower mapped IDs in this same provider family.
+	for _, retirement := range acceptedUnionRetirements(syncResult, "openai", now) {
+		if productRetiredNow(retirement, now) {
+			ids = append(ids, retirement.ModelID)
+		}
+	}
+	ids = uniqueProductModelIDs(ids)
 	out := make([]ProductModelAvailability, 0, len(ids))
 	for _, modelID := range ids {
 		provider := productProviderForModelID(modelID)
@@ -351,8 +362,63 @@ func EvaluateProductAvailability(syncResult StartupSyncResult, modelIDs []string
 		}
 		out = append(out, decision)
 	}
+	applyProductVersionFloor(out)
 	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
 	return out
+}
+
+// applyProductVersionFloor cascades only authoritative negatives already
+// accepted for automatic removal. Insufficient evidence and incomplete
+// product catalogs never create a version floor.
+func applyProductVersionFloor(items []ProductModelAvailability) {
+	floors := map[string]ProductModelAvailability{}
+	for _, item := range items {
+		family, recognized := modelversion.Family(item.ModelID)
+		if item.Status != "unavailable" || !recognized || !officialVersionFloorTrigger(item) {
+			continue
+		}
+		key := item.Provider + "\x00" + family
+		current, ok := floors[key]
+		if !ok || modelversion.HigherVersion(item.ModelID, current.ModelID) {
+			floors[key] = item
+		}
+	}
+	for i := range items {
+		item := &items[i]
+		family, recognized := modelversion.Family(item.ModelID)
+		if !recognized {
+			continue
+		}
+		floor, ok := floors[item.Provider+"\x00"+family]
+		if !ok || !modelversion.LowerVersion(item.ModelID, floor.ModelID) {
+			continue
+		}
+		// Preserve the hard cascade marker even when this lower ID also has
+		// direct absence evidence: only the cascade marker authorizes removal of
+		// unmanaged mappings under the owner rule.
+		item.Status = "unavailable"
+		item.MatchKind = "lower_than_unavailable_version"
+		item.VersionFloorModelID = floor.ModelID
+		item.SourceIDs = append([]string(nil), floor.SourceIDs...)
+		item.SourceURLs = append([]string(nil), floor.SourceURLs...)
+		item.ContentSHA256 = append([]string(nil), floor.ContentSHA256...)
+		item.RetrievedAt = floor.RetrievedAt
+	}
+}
+
+func officialVersionFloorTrigger(item ProductModelAvailability) bool {
+	switch item.MatchKind {
+	case "accepted_union_absence", "accepted_union_retirement", "accepted_union_version_floor":
+		return true // These records are produced only after accepted-union source validation above.
+	case "official_account_absence":
+		return item.Provider == "volcengine" && len(item.SourceIDs) == 1 && item.SourceIDs[0] == "volcengine-ark-account-models" &&
+			len(item.SourceURLs) == 1 && item.SourceURLs[0] == "https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"
+	case "official_api_catalog_absence":
+		return item.Provider == "alibaba" && len(item.SourceIDs) == 1 && item.SourceIDs[0] == "alibaba-model-studio-models" && len(item.SourceURLs) == 1 &&
+			strings.HasPrefix(item.SourceURLs[0], "https://ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com/api/v1/models?")
+	default:
+		return false
+	}
 }
 
 type productVersion struct {
@@ -464,6 +530,7 @@ func EvaluateArkAccountAvailability(syncResult StartupSyncResult, platform strin
 			SourceIDs: []string{spec.id}, SourceURLs: []string{page.URL}, ContentSHA256: []string{page.ContentSHA256}, RetrievedAt: page.FetchedAt,
 		})
 	}
+	applyProductVersionFloor(out)
 	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
 	return out
 }
@@ -523,6 +590,7 @@ func EvaluateAlibabaModelStudioAvailability(syncResult StartupSyncResult, platfo
 			SourceIDs: []string{spec.id}, SourceURLs: []string{spec.rootURL}, ContentSHA256: []string{result.Snapshot.ContentSHA256}, RetrievedAt: result.Snapshot.FetchedAt,
 		})
 	}
+	applyProductVersionFloor(out)
 	sort.Slice(out, func(i, j int) bool { return out[i].ModelID < out[j].ModelID })
 	return out
 }
