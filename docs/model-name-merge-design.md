@@ -28,3 +28,9 @@ Recommendations show how many approved source-scoped alias and family rules alre
 - Case-fold and underscore folding can still join distinct provider IDs. That is why these are human-review candidates only, never automatic merges.
 - The report is based on separate inspect and discover snapshots; mapping drift must be reviewed before a later rules change.
 - No candidate is proof of equivalence or a recommendation of which upstream ID to prefer.
+
+## Implementation and VPS deployment (2026-10-20)
+
+The report-only name review is implemented and included in commit `45b102c4238973c32f4371436c1d84cc04579fd9` on `origin/codex/official-selectability-auto-sync`. Verification passed: `go test ./... -count=1`, `go vet ./...`, Linux amd64 build, `git diff --check`, and the independent read-only audit. The Linux binary SHA-256 is `66d817164c6724e4e5a6dd6c25672dd7749345d75dcdb5f5d0b3193e54871847`.
+
+The binary was installed atomically at `/opt/sub2api-model-catalog-manager/bin/model-catalog-manager` on the Philippines VPS, matching the actual `ExecStart` of `sub2api-model-catalog-manager.service`. The previous binary is preserved at `/var/backups/sub2api-model-catalog-manager/deploy-merge-review-20261019T193338Z-45b102c/model-catalog-manager`. Remote SHA-256 matched, ownership/mode are `root:root` and `0755`, and the new CLI `--help` smoke check passed. The manual-only oneshot service was inactive before and after deployment. No screening run, inference probe, or mapping Apply was started.
