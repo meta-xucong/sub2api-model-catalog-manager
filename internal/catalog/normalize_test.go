@@ -15,6 +15,252 @@ func sourceFixture() Source {
 	return Source{Platform: "openai", AccountType: "apikey", APIProtocol: "openai", BaseURL: "https://provider.example/v1", AccountID: 9001}
 }
 
+func TestProductAvailabilityAcceptsAccountScopedOfficialAbsence(t *testing.T) {
+	item := ProductModelAvailability{
+		ModelID: "doubao-seed-2-0-lite", Provider: "volcengine", Status: "unavailable", MatchKind: "official_account_absence",
+		SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"},
+		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: time.Date(2026, 10, 18, 4, 0, 0, 0, time.UTC),
+	}
+	if err := validateProductModelAvailability(item); err != nil {
+		t.Fatalf("complete account-scoped absence was rejected: %v", err)
+	}
+	item.SourceIDs = nil
+	if err := validateProductModelAvailability(item); err == nil {
+		t.Fatal("account-scoped absence without source evidence was accepted")
+	}
+}
+
+func TestVersionFloorEvidenceIsBoundToApprovedOfficialCatalogs(t *testing.T) {
+	base := ProductModelAvailability{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_version_floor",
+		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
+		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC),
+	}
+	if err := validateProductModelAvailability(base); err != nil {
+		t.Fatalf("approved OpenAI version-floor evidence was rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*ProductModelAvailability)
+	}{
+		{name: "unrecognized source", edit: func(item *ProductModelAvailability) { item.SourceIDs = []string{"arbitrary-source"} }},
+		{name: "mismatched provider", edit: func(item *ProductModelAvailability) { item.Provider = "xai" }},
+		{name: "model outside provider family", edit: func(item *ProductModelAvailability) { item.ModelID = "grok-4.3" }},
+		{name: "separate Codex Spark family", edit: func(item *ProductModelAvailability) { item.ModelID = "gpt-5.4-codex-spark" }},
+		{name: "mismatched URL", edit: func(item *ProductModelAvailability) { item.SourceURLs = []string{"https://example.com/models"} }},
+		{name: "multiple sources", edit: func(item *ProductModelAvailability) {
+			item.SourceIDs = []string{"openai-codex-models", "xai-grok-web-models"}
+			item.SourceURLs = []string{"https://developers.openai.com/codex/models", "https://x.ai/news/grok-4-5-everywhere"}
+			item.ContentSHA256 = []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			item := base
+			item.SourceIDs = append([]string(nil), base.SourceIDs...)
+			item.SourceURLs = append([]string(nil), base.SourceURLs...)
+			item.ContentSHA256 = append([]string(nil), base.ContentSHA256...)
+			tc.edit(&item)
+			if err := validateProductModelAvailability(item); err == nil {
+				t.Fatal("unbound version-floor evidence was accepted")
+			}
+		})
+	}
+	grok := base
+	grok.ModelID, grok.Provider = "grok-4.3", "xai"
+	grok.SourceIDs = []string{"xai-grok-web-models"}
+	grok.SourceURLs = []string{"https://x.ai/news/grok-4-5-everywhere"}
+	if err := validateProductModelAvailability(grok); err != nil {
+		t.Fatalf("approved Grok version-floor evidence was rejected: %v", err)
+	}
+	grok.ModelID = "gpt-5.4"
+	if err := validateProductModelAvailability(grok); err == nil {
+		t.Fatal("Grok catalog floor evidence was accepted for a GPT model ID")
+	}
+	retirement := ProductModelAvailability{
+		ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement",
+		SourceIDs: []string{"openai-cross-product-lifecycle-v2"}, SourceURLs: []string{"https://learn.chatgpt.com/docs/changelog"},
+		ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: base.RetrievedAt,
+	}
+	if err := validateProductModelAvailability(retirement); err != nil {
+		t.Fatalf("approved OpenAI cross-product retirement evidence was rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*ProductModelAvailability)
+	}{
+		{name: "arbitrary lifecycle source", edit: func(item *ProductModelAvailability) { item.SourceIDs = []string{"arbitrary-source"} }},
+		{name: "wrong provider", edit: func(item *ProductModelAvailability) { item.Provider = "xai" }},
+		{name: "non GPT model", edit: func(item *ProductModelAvailability) { item.ModelID = "grok-4.3" }},
+	} {
+		item := retirement
+		item.SourceIDs = append([]string(nil), retirement.SourceIDs...)
+		item.SourceURLs = append([]string(nil), retirement.SourceURLs...)
+		item.ContentSHA256 = append([]string(nil), retirement.ContentSHA256...)
+		tc.edit(&item)
+		if err := validateProductModelAvailability(item); err == nil {
+			t.Errorf("%s retirement evidence was accepted", tc.name)
+		}
+	}
+}
+
+func TestArkAccountAbsenceIsBoundToVolcengineAndOwnership(t *testing.T) {
+	s := Source{Platform: "volcengine", AccountType: "apikey", APIProtocol: "openai", BaseURL: "https://provider.example/v1", AccountID: 9002}
+	rules := identitySyncRules(s)
+	fingerprint := SourceFingerprint(s)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	unavailable := ProductModelAvailability{
+		ModelID: "doubao-seed-2-0-lite", Provider: "volcengine", Status: "unavailable", MatchKind: "official_account_absence",
+		SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"},
+		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: now,
+	}
+	positive := ProductModelAvailability{
+		ModelID: "doubao-seed-2-1-pro", Provider: "volcengine", Status: "available", MatchKind: "exact",
+		SourceIDs: []string{"volcengine-ark-account-models"}, SourceURLs: []string{"https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"},
+		ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: now,
+	}
+	makeInput := func(mapping map[string]string, managed map[string]state.ManagedMapping) Input {
+		in := identitySyncInput(s, mapping, []string{"doubao-seed-2-0-lite", "doubao-seed-2-1-pro"})
+		in.ProductAvailabilityEnforced = true
+		in.ProductAvailability = []ProductModelAvailability{unavailable, positive}
+		in.ManagedMappings = managed
+		return in
+	}
+	owned := makeInput(map[string]string{"doubao-seed-2-0-lite": "doubao-seed-2-0-lite", "legacy-alias": "doubao-seed-2-0-lite"}, map[string]state.ManagedMapping{
+		"doubao-seed-2-0-lite": {LastAppliedValue: "doubao-seed-2-0-lite", SourceFingerprint: fingerprint},
+		"legacy-alias":         {LastAppliedValue: "doubao-seed-2-0-lite", SourceFingerprint: fingerprint},
+	})
+	plan, err := Normalize(rules, owned, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || plan.After["doubao-seed-2-0-lite"] != "" || plan.After["legacy-alias"] != "" || plan.After["doubao-seed-2-1-pro"] != "doubao-seed-2-1-pro" {
+		t.Fatalf("owned unavailable Ark mappings were not removed while preserving the current model: %#v", plan)
+	}
+	arkReasonFound := false
+	for _, change := range plan.Changes {
+		if change.Action == "remove" && strings.Contains(change.Reason, "configured Volcengine account") {
+			arkReasonFound = true
+		}
+	}
+	if len(plan.Changes) != 3 || !arkReasonFound {
+		t.Fatalf("Ark removal reason did not describe account-scoped evidence: %#v", plan.Changes)
+	}
+	for _, tc := range []struct {
+		name    string
+		managed map[string]state.ManagedMapping
+	}{
+		{name: "unowned"},
+		{name: "drifted", managed: map[string]state.ManagedMapping{
+			"doubao-seed-2-0-lite": {LastAppliedValue: "other-model", SourceFingerprint: fingerprint},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := makeInput(map[string]string{"doubao-seed-2-0-lite": "doubao-seed-2-0-lite"}, tc.managed)
+			got, err := Normalize(rules, input, state.Account{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ApplyEligible || len(got.Changes) != 0 || got.After["doubao-seed-2-0-lite"] != "doubao-seed-2-0-lite" {
+				t.Fatalf("Ark absence changed an unowned or drifted mapping: %#v", got)
+			}
+		})
+	}
+	for _, platform := range []string{"Volcengine", " volcengine", "volcengine "} {
+		input := makeInput(map[string]string{}, nil)
+		input.Source.Platform = platform
+		if _, err := Normalize(rules, input, state.Account{}); err == nil {
+			t.Fatalf("Ark account absence was accepted for non-literal platform %q", platform)
+		}
+	}
+	wrongPlatformPositive := makeInput(map[string]string{}, nil)
+	wrongPlatformPositive.Source.Platform = "alibaba"
+	wrongPlatformPositive.ProductAvailability = []ProductModelAvailability{positive}
+	if _, err := Normalize(rules, wrongPlatformPositive, state.Account{}); err == nil || !strings.Contains(err.Error(), "official model availability evidence") {
+		t.Fatalf("Ark exact-positive evidence was not rejected for another platform: err=%v", err)
+	}
+}
+
+func TestBailianModelStudioAbsenceIsBoundToAlibabaAndOwnership(t *testing.T) {
+	s := Source{Platform: "alibaba", AccountType: "apikey", APIProtocol: "openai", BaseURL: "https://ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", AccountID: 9003}
+	rules := identitySyncRules(s)
+	fingerprint := SourceFingerprint(s)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	baseEvidence := func(id, status, match string, digit byte) ProductModelAvailability {
+		return ProductModelAvailability{
+			ModelID: id, Provider: "alibaba", Status: status, MatchKind: match,
+			SourceIDs: []string{"alibaba-model-studio-models"}, SourceURLs: []string{"https://ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com/api/v1/models?page_no=1&page_size=200"},
+			ContentSHA256: []string{strings.Repeat(string(digit), 64)}, RetrievedAt: now,
+		}
+	}
+	unavailable := baseEvidence("qwen3.5-plus", "unavailable", "official_api_catalog_absence", 'a')
+	positive := baseEvidence("qwen3.7-plus", "available", "exact", 'b')
+	makeInput := func(mapping map[string]string, managed map[string]state.ManagedMapping) Input {
+		in := identitySyncInput(s, mapping, []string{"qwen3.5-plus", "qwen3.7-plus"})
+		in.ProductAvailabilityEnforced = true
+		in.ProductAvailability = []ProductModelAvailability{unavailable, positive}
+		in.ManagedMappings = managed
+		return in
+	}
+	owned := makeInput(map[string]string{"qwen3.5-plus": "qwen3.5-plus", "legacy-alias": "qwen3.5-plus"}, map[string]state.ManagedMapping{
+		"qwen3.5-plus": {LastAppliedValue: "qwen3.5-plus", SourceFingerprint: fingerprint},
+		"legacy-alias": {LastAppliedValue: "qwen3.5-plus", SourceFingerprint: fingerprint},
+	})
+	plan, err := Normalize(rules, owned, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || plan.After["qwen3.5-plus"] != "" || plan.After["legacy-alias"] != "" || plan.After["qwen3.7-plus"] != "qwen3.7-plus" {
+		t.Fatalf("owned unavailable Model Studio mappings were not removed safely: %#v", plan)
+	}
+	modelStudioReasonFound := false
+	for _, change := range plan.Changes {
+		if change.Action == "remove" && strings.Contains(change.Reason, "official Beijing Model Studio API catalog") {
+			modelStudioReasonFound = true
+		}
+	}
+	if !modelStudioReasonFound {
+		t.Fatalf("Model Studio removal reason did not identify its account-scoped evidence: %#v", plan.Changes)
+	}
+	for _, tc := range []struct {
+		name    string
+		managed map[string]state.ManagedMapping
+	}{
+		{name: "unowned"},
+		{name: "drifted", managed: map[string]state.ManagedMapping{
+			"qwen3.5-plus": {LastAppliedValue: "other-model", SourceFingerprint: fingerprint},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := makeInput(map[string]string{"qwen3.5-plus": "qwen3.5-plus"}, tc.managed)
+			got, err := Normalize(rules, input, state.Account{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ApplyEligible || len(got.Changes) != 0 || got.After["qwen3.5-plus"] != "qwen3.5-plus" {
+				t.Fatalf("Model Studio absence changed an unowned or drifted mapping: %#v", got)
+			}
+		})
+	}
+	wrongPlatform := makeInput(map[string]string{}, nil)
+	wrongPlatform.Source.Platform = "volcengine"
+	if _, err := Normalize(rules, wrongPlatform, state.Account{}); err == nil {
+		t.Fatal("Model Studio catalog absence was accepted for another platform")
+	}
+	wrongPositive := makeInput(map[string]string{}, nil)
+	wrongPositive.Source.Platform = "volcengine"
+	wrongPositive.ProductAvailability = []ProductModelAvailability{positive}
+	if _, err := Normalize(rules, wrongPositive, state.Account{}); err == nil {
+		t.Fatal("Model Studio exact-positive evidence was accepted for another platform")
+	}
+	wrongWorkspace := makeInput(map[string]string{"qwen3.5-plus": "qwen3.5-plus"}, map[string]state.ManagedMapping{
+		"qwen3.5-plus": {LastAppliedValue: "qwen3.5-plus", SourceFingerprint: fingerprint},
+	})
+	wrongWorkspace.Source.BaseURL = "https://other-workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+	if _, err := Normalize(rules, wrongWorkspace, state.Account{}); err == nil || !strings.Contains(err.Error(), "outside the configured Alibaba workspace") {
+		t.Fatalf("Beijing workspace absence was accepted for another workspace: err=%v", err)
+	}
+}
+
 func approvedAlias(source Source, upstream, public string) AliasRule {
 	return AliasRule{Source: source, UpstreamID: upstream, PublicID: public, Decision: "approved", Evidence: "https://provider.example/models", ReviewedAt: "2026-10-11"}
 }
@@ -430,6 +676,313 @@ func TestAdditiveLiveIdentityCatalogKeepsMappingsMissingFromPossiblyPartialList(
 	}
 }
 
+func TestOfficialProductUnionBlocksUnprovenImportsAndPreservesUnknownMappings(t *testing.T) {
+	s := sourceFixture()
+	rules := identitySyncRules(s)
+	observed := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	positive := func(id string) ProductModelAvailability {
+		return ProductModelAvailability{ModelID: id, Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: observed}
+	}
+	uncertain := func(id string) ProductModelAvailability {
+		return ProductModelAvailability{ModelID: id, Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}
+	}
+	in := identitySyncInput(s, map[string]string{"gpt-5.5": "gpt-5.5"}, []string{"gpt-6-sol", "gpt-4o-audio-preview", "gpt-4o-realtime-preview", "deepseek-flash", "qwen3.8-flash"})
+	in.ProductAvailabilityEnforced = true
+	in.ProductAvailability = []ProductModelAvailability{
+		positive("gpt-6-sol"), uncertain("gpt-4o-audio-preview"), uncertain("gpt-4o-realtime-preview"), uncertain("gpt-5.5"),
+		{ModelID: "deepseek-flash", Provider: "deepseek", Status: "insufficient_evidence", MatchKind: "none"},
+		{ModelID: "qwen3.8-flash", Provider: "alibaba", Status: "insufficient_evidence", MatchKind: "none"},
+	}
+	in.LifecycleScopes = []string{"openai_codex_chatgpt_login"}
+	in.LifecycleExclusions = []LifecycleExclusion{{
+		Scope: "openai_codex_chatgpt_login", ModelID: "gpt-5.5", Status: "retired",
+		SourceID: "openai-cross-product-lifecycle-v2", SourceURL: "https://learn.chatgpt.com/docs/changelog",
+		SourceTitle: "Codex changelog", RetrievedAt: observed, ContentSHA256: strings.Repeat("b", 64),
+		Excerpt: "gpt-5.5 retired from Codex only",
+	}}
+	plan, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+		t.Fatalf("product availability evidence should safely produce an additive plan: %#v", plan)
+	}
+	if plan.After["gpt-5.5"] != "gpt-5.5" {
+		t.Fatalf("Codex-only retirement with incomplete ChatGPT evidence removed the existing mapping: %#v", plan.After)
+	}
+	if plan.After["gpt-6-sol"] != "gpt-6-sol" {
+		t.Fatalf("exact current user-product model was not imported: %#v", plan.After)
+	}
+	for _, id := range []string{"gpt-4o-audio-preview", "gpt-4o-realtime-preview", "deepseek-flash", "qwen3.8-flash"} {
+		if _, imported := plan.After[id]; imported {
+			t.Fatalf("unconfirmed product model %s was imported: %#v", id, plan.After)
+		}
+	}
+	if plan.ProductAvailabilitySHA256 == "" {
+		t.Fatal("the approval plan did not bind the product availability evidence")
+	}
+}
+
+func TestAllAccountProbeFailureRemovesEveryMappingForExactTarget(t *testing.T) {
+	s := sourceFixture()
+	observed := time.Date(2026, 10, 19, 7, 0, 0, 0, time.UTC)
+	base := ProductModelAvailability{ModelID: "gpt-5.5", Provider: "openai", MatchKind: "all_account_probes_failed", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: observed}
+	in := Input{AccountID: s.AccountID, Source: s, Completeness: CompletenessUnknown, CurrentMapping: map[string]string{"alias-one": "gpt-5.5", "gpt-5.5": "gpt-5.5", "case-variant": "GPT-5.5", "other": "gpt-6-sol"}, LiveModels: []string{"gpt-5.5"}, LiveListAvailable: true, ProductAvailabilityEnforced: true, ProductAvailability: []ProductModelAvailability{{ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: base.MatchKind, SourceIDs: base.SourceIDs, SourceURLs: base.SourceURLs, ContentSHA256: base.ContentSHA256, RetrievedAt: base.RetrievedAt}, {ModelID: "gpt-6-sol", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}}}
+	plan, err := Normalize(baseRules(), in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plan.After["alias-one"]; ok {
+		t.Fatalf("alias mapping to the failed exact target remains: %#v", plan.After)
+	}
+	if _, ok := plan.After["gpt-5.5"]; ok {
+		t.Fatalf("identity mapping to the failed exact target remains: %#v", plan.After)
+	}
+	if plan.After["case-variant"] != "GPT-5.5" {
+		t.Fatalf("probe failure removed a case-distinct upstream ID: %#v", plan.After)
+	}
+	if plan.After["other"] != "gpt-6-sol" {
+		t.Fatalf("unrelated mapping changed: %#v", plan.After)
+	}
+	identitySync := in
+	identitySync.AllowIdentityCatalogSync = true
+	identitySync.IdentityCatalogPolicy = "add_identity_from_live_list"
+	identityPlan, err := Normalize(baseRules(), identitySync, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identityPlan.After["case-variant"] != "GPT-5.5" {
+		t.Fatalf("probe evidence authorized identity-sync removal of a case-distinct ID: %#v", identityPlan.After)
+	}
+}
+
+func TestIncompleteAccountProbePreservesExactTargetMapping(t *testing.T) {
+	s := sourceFixture()
+	observed := time.Date(2026, 10, 19, 7, 0, 0, 0, time.UTC)
+	ignored := ProductModelAvailability{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: observed}
+	in := Input{AccountID: s.AccountID, Source: s, Completeness: CompletenessUnknown, CurrentMapping: map[string]string{"gpt-5.5": "gpt-5.5", "case-variant": "GPT-5.5", "other": "gpt-6-sol"}, LiveModels: []string{"gpt-5.5"}, LiveListAvailable: true, ProductAvailabilityEnforced: true, ProductAvailability: []ProductModelAvailability{ignored, {ModelID: "gpt-6-sol", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}}}
+	plan, err := Normalize(baseRules(), in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.After["gpt-5.5"] != "gpt-5.5" || plan.After["case-variant"] != "GPT-5.5" || plan.After["other"] != "gpt-6-sol" {
+		t.Fatalf("incomplete probe changed an exact or case-distinct mapping: %#v", plan.After)
+	}
+}
+
+func TestAcceptedUnionAndVersionFloorUnavailableRemoveRelayPresentIDs(t *testing.T) {
+	s := sourceFixture()
+	rules := identitySyncRules(s)
+	fingerprint := SourceFingerprint(s)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	unavailable := ProductModelAvailability{
+		ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement",
+		SourceIDs: []string{"openai-cross-product-lifecycle-v2"}, SourceURLs: []string{"https://learn.chatgpt.com/docs/changelog"},
+		ContentSHA256: []string{strings.Repeat("d", 64)}, RetrievedAt: now,
+	}
+	positive := ProductModelAvailability{
+		ModelID: "gpt-6-sol", Provider: "openai", Status: "available", MatchKind: "exact",
+		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
+		ContentSHA256: []string{strings.Repeat("e", 64)}, RetrievedAt: now,
+	}
+	versionFloor := ProductModelAvailability{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_version_floor",
+		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
+		ContentSHA256: []string{strings.Repeat("f", 64)}, RetrievedAt: now,
+	}
+	current := map[string]string{"gpt-5.5": "gpt-5.5", "gpt-5.4": "gpt-5.4", "custom-route": "gpt-5.5"}
+	in := identitySyncInput(s, current, []string{"gpt-5.5", "gpt-5.4", "gpt-6-sol"})
+	in.ProductAvailabilityEnforced = true
+	in.ProductAvailability = []ProductModelAvailability{unavailable, versionFloor, positive}
+	in.ManagedMappings = map[string]state.ManagedMapping{
+		"gpt-5.5":      {LastAppliedValue: "gpt-5.5", SourceFingerprint: fingerprint},
+		"gpt-5.4":      {LastAppliedValue: "gpt-5.4", SourceFingerprint: fingerprint},
+		"custom-route": {LastAppliedValue: "gpt-5.5", SourceFingerprint: fingerprint},
+	}
+	plan, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || plan.After["gpt-5.5"] != "" || plan.After["gpt-5.4"] != "" || plan.After["custom-route"] != "" || plan.After["gpt-6-sol"] != "gpt-6-sol" {
+		t.Fatalf("accepted-union retirement or version-floor evidence did not remove stale relay IDs while keeping the exact positive: %#v", plan)
+	}
+	if len(plan.Changes) != 4 {
+		t.Fatalf("expected three stale-mapping removals and one exact positive add, got %#v", plan.Changes)
+	}
+
+	in.ManagedMappings = map[string]state.ManagedMapping{}
+	approvedCandidate, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !approvedCandidate.ApplyEligible || len(approvedCandidate.Conflicts) != 0 || approvedCandidate.After["gpt-5.5"] != "" || approvedCandidate.After["gpt-5.4"] != "" || approvedCandidate.After["custom-route"] != "" {
+		t.Fatalf("official product-union evidence should propose removals even for mappings not previously managed by this tool: %#v", approvedCandidate)
+	}
+	unboundedAbsence := unavailable
+	unboundedAbsence.MatchKind = "accepted_union_absence"
+	unboundedAbsence.SourceIDs = []string{"unreviewed-source"}
+	unboundedAbsence.SourceURLs = []string{"https://example.com/models"}
+	in.ProductAvailability = []ProductModelAvailability{unboundedAbsence, versionFloor, positive}
+	blockedAbsence, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedAbsence.ApplyEligible || len(blockedAbsence.Changes) != 0 {
+		t.Fatalf("unbound complete-catalog absence should not authorize unmanaged mapping removal: %#v", blockedAbsence)
+	}
+}
+
+func TestProductAvailabilityGatesAliasAndVersionFamilyTargets(t *testing.T) {
+	s := sourceFixture()
+	rules := baseRules()
+	rules.Aliases = []AliasRule{approvedAlias(s, "alias-target", "alias-public")}
+	rules.VersionFamilies = []VersionFamily{exactFamily(s, "canonical", "preferred",
+		FamilyMember{UpstreamID: "preferred", ExactIDAction: "keep"},
+		FamilyMember{UpstreamID: "keep-new", ExactIDAction: "keep"},
+	)}
+	fingerprint := SourceFingerprint(s)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	availability := func(id, status string) ProductModelAvailability {
+		item := ProductModelAvailability{ModelID: id, Provider: "test-vendor", Status: status, MatchKind: "none"}
+		if status == "available" {
+			item.MatchKind = "exact"
+			item.SourceIDs = []string{"test-login-models"}
+			item.SourceURLs = []string{"https://provider.example/models"}
+			item.ContentSHA256 = []string{strings.Repeat("f", 64)}
+			item.RetrievedAt = now
+		}
+		return item
+	}
+	current := map[string]string{
+		"canonical":     "old-canonical",
+		"alias-public":  "old-alias",
+		"keep-existing": "keep-existing",
+	}
+	live := []string{"preferred", "alias-target", "keep-new"}
+	in := Input{
+		AccountID: s.AccountID, Source: s, CurrentMapping: current, LiveModels: live, LiveListAvailable: true, Completeness: CompletenessUnknown,
+		ProductAvailabilityEnforced: true,
+		ProductAvailability: []ProductModelAvailability{
+			availability("preferred", "insufficient_evidence"),
+			availability("alias-target", "insufficient_evidence"),
+			availability("keep-new", "insufficient_evidence"),
+			availability("old-canonical", "insufficient_evidence"),
+			availability("old-alias", "insufficient_evidence"),
+			availability("keep-existing", "insufficient_evidence"),
+		},
+	}
+	uncertain, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !uncertain.ApplyEligible || len(uncertain.Conflicts) != 0 || len(uncertain.Changes) != 0 {
+		t.Fatalf("incomplete product evidence should preserve mappings without applying family/alias actions: %#v", uncertain)
+	}
+	for key, value := range current {
+		if uncertain.After[key] != value {
+			t.Fatalf("insufficient evidence changed existing mapping %s: got %#v", key, uncertain.After)
+		}
+	}
+	if _, exists := uncertain.After["canonical"]; !exists {
+		t.Fatal("uncertain preferred family target removed its existing canonical mapping")
+	}
+	if _, exists := uncertain.After["keep-new"]; exists {
+		t.Fatal("uncertain keep member was automatically imported")
+	}
+
+	for i := range in.ProductAvailability {
+		in.ProductAvailability[i] = availability(in.ProductAvailability[i].ModelID, "available")
+	}
+	in.ManagedMappings = map[string]state.ManagedMapping{
+		"canonical":    {LastAppliedValue: "old-canonical", SourceFingerprint: fingerprint},
+		"alias-public": {LastAppliedValue: "old-alias", SourceFingerprint: fingerprint},
+	}
+	positive, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !positive.ApplyEligible || positive.After["canonical"] != "preferred" || positive.After["alias-public"] != "alias-target" || positive.After["keep-new"] != "keep-new" {
+		t.Fatalf("exact positive product evidence did not permit reviewed exact targets: %#v", positive)
+	}
+}
+
+func TestProductAvailabilityGatesIdentitySyncFamilyPreferredAndKeep(t *testing.T) {
+	s := sourceFixture()
+	rules := identitySyncRules(s)
+	rules.VersionFamilies = []VersionFamily{exactFamily(s, "canonical", "preferred",
+		FamilyMember{UpstreamID: "preferred", ExactIDAction: "keep"},
+		FamilyMember{UpstreamID: "keep-new", ExactIDAction: "keep"},
+	)}
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	availability := func(id, status string) ProductModelAvailability {
+		item := ProductModelAvailability{ModelID: id, Provider: "openai", Status: status, MatchKind: "none"}
+		if status == "available" {
+			item.MatchKind = "exact"
+			item.SourceIDs = []string{"openai-codex-models"}
+			item.SourceURLs = []string{"https://developers.openai.com/codex/models"}
+			item.ContentSHA256 = []string{strings.Repeat("c", 64)}
+			item.RetrievedAt = now
+		}
+		return item
+	}
+	for _, tc := range []struct {
+		name          string
+		preferred     string
+		keep          string
+		wantCanonical string
+		wantKeep      bool
+	}{
+		{name: "uncertain preferred", preferred: "insufficient_evidence", keep: "insufficient_evidence"},
+		{name: "uncertain keep", preferred: "available", keep: "insufficient_evidence", wantCanonical: "preferred"},
+		{name: "both exact positive", preferred: "available", keep: "available", wantCanonical: "preferred", wantKeep: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := identitySyncInput(s, map[string]string{"existing": "existing"}, []string{"preferred", "keep-new"})
+			in.ProductAvailabilityEnforced = true
+			in.ProductAvailability = []ProductModelAvailability{availability("preferred", tc.preferred), availability("keep-new", tc.keep), availability("existing", "insufficient_evidence")}
+			plan, err := Normalize(rules, in, state.Account{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.After["canonical"] != tc.wantCanonical {
+				t.Fatalf("family preferred target bypassed product evidence gate: %#v", plan)
+			}
+			_, hasKeep := plan.After["keep-new"]
+			if hasKeep != tc.wantKeep {
+				t.Fatalf("family keep target did not follow exact product evidence: %#v", plan)
+			}
+			if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+				t.Fatalf("uncertain family evidence should not make unrelated exact mapping changes conflict: %#v", plan)
+			}
+		})
+	}
+}
+
+func TestPartialProductEvidenceGatesTargetModelsOnly(t *testing.T) {
+	s := sourceFixture()
+	rules := identitySyncRules(s)
+	rules.VersionFamilies = []VersionFamily{exactFamily(s, "gpt-5.2", "gpt-5.2",
+		FamilyMember{UpstreamID: "gpt-5.2", ExactIDAction: "keep"},
+		FamilyMember{UpstreamID: "gpt-5.4", ExactIDAction: "keep"},
+	)}
+	in := identitySyncInput(s, map[string]string{"gpt-5.2": "gpt-5.2"}, []string{"gpt-5.2", "gpt-5.4", "custom-live-model"})
+	in.ProductAvailabilityEnforced = true
+	in.ProductAvailability = []ProductModelAvailability{{ModelID: "gpt-5.2", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}, {ModelID: "gpt-5.4", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}}
+	plan, err := Normalize(rules, in, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || plan.After["gpt-5.2"] != "gpt-5.2" {
+		t.Fatalf("insufficient evidence must preserve the exact existing GPT mapping: %#v", plan)
+	}
+	if _, exists := plan.After["gpt-5.4"]; exists {
+		t.Fatalf("version-family keep bypassed insufficient product evidence: %#v", plan.After)
+	}
+	if plan.After["custom-live-model"] != "custom-live-model" {
+		t.Fatalf("screening changed the existing non-target vendor behavior: %#v", plan.After)
+	}
+}
+
 func TestAdditiveCatalogStillAppliesExactOwnedLifecycleExclusion(t *testing.T) {
 	source := sourceFixture()
 	rules := baseRules()
@@ -770,6 +1323,48 @@ func TestProductLifecycleRefusesUnownedOrDriftedEdgesAndKeepsUnknownIDs(t *testi
 	}
 }
 
+func TestOfficialProductLifecycleCanRemoveUnownedExactIdentityMapping(t *testing.T) {
+	source := sourceFixture()
+	rules := identitySyncRules(source)
+	rules.SourceProfiles[0].LifecycleScopes = []string{"openai_codex_chatgpt_login"}
+	current := map[string]string{"gpt-5.2": "gpt-5.2", "keep": "keep"}
+	input := identitySyncInput(source, current, []string{"gpt-5.2", "keep"})
+	input.LifecycleScopes = []string{"openai_codex_chatgpt_login"}
+	input.LifecycleExclusions = []LifecycleExclusion{{
+		Scope: "openai_codex_chatgpt_login", ModelID: "gpt-5.2", Status: "deprecated", SourceID: "openai-cross-product-lifecycle-v2",
+		SourceURL: "https://learn.chatgpt.com/docs/changelog", SourceTitle: "Codex changelog", RetrievedAt: time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC),
+		ContentSHA256: strings.Repeat("c", 64), Excerpt: "GPT-5.2 is deprecated for Codex",
+	}}
+	plan, err := Normalize(rules, input, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+		t.Fatalf("official exclusion of an exact identity mapping should be applicable: conflicts=%v", plan.Conflicts)
+	}
+	if _, exists := plan.After["gpt-5.2"]; exists {
+		t.Fatal("unowned exact identity mapping was retained despite official exclusion")
+	}
+	if plan.After["keep"] != "keep" {
+		t.Fatalf("unrelated mapping changed: %#v", plan.After)
+	}
+	if len(plan.Changes) != 1 || !strings.Contains(plan.Changes[0].Reason, "exact identity mapping") {
+		t.Fatalf("removal was not narrowly explained: %+v", plan.Changes)
+	}
+}
+
+func TestOfficialProductLifecycleEvidenceCannotCrossProviderNamespaces(t *testing.T) {
+	for _, item := range []LifecycleExclusion{
+		{Scope: "openai_codex_chatgpt_login", ModelID: "deepseek-flash", Status: "not_listed"},
+		{Scope: "anthropic_claude_code_login", ModelID: "gpt-5.2", Status: "retired"},
+		{Scope: "kimi_code_login", ModelID: "claude-sonnet-4-5", Status: "not_listed"},
+	} {
+		if validLifecycleExclusion(item) {
+			t.Fatalf("cross-provider product ID accepted as lifecycle evidence: %+v", item)
+		}
+	}
+}
+
 func TestLifecycleEvidenceDigestIgnoresRefreshOnlyTimestamp(t *testing.T) {
 	evidence := LifecycleExclusion{
 		Scope: "openai_codex_chatgpt_login", ModelID: "gpt-5.4", Status: "retired",
@@ -788,6 +1383,56 @@ func TestLifecycleEvidenceDigestIgnoresRefreshOnlyTimestamp(t *testing.T) {
 	}
 	if first != second {
 		t.Fatal("a 304-only retrieval timestamp change altered semantic lifecycle evidence digest")
+	}
+}
+
+func TestFullScreenPrunesMissingOwnedRoutesFrom404tokenCatalog(t *testing.T) {
+	source := sourceFixture()
+	fingerprint := SourceFingerprint(source)
+	current := map[string]string{
+		"keep-live": "keep-live",
+		"remove-me": "remove-me",
+		"custom":    "provider-specific-id",
+		"fallback":  "gpt-*",
+	}
+	managed := make(map[string]state.ManagedMapping, len(current))
+	for publicID, upstreamID := range current {
+		managed[publicID] = state.ManagedMapping{LastAppliedValue: upstreamID, SourceFingerprint: fingerprint}
+	}
+	plan, err := Normalize(baseRules(), Input{
+		AccountID: source.AccountID, Source: source, CurrentMapping: current, ManagedMappings: managed,
+		LiveModels: []string{"keep-live"}, LiveListAvailable: true, Completeness: CompletenessUnknown,
+		PruneMissingMappings: true,
+	}, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.ApplyEligible || len(plan.Conflicts) != 0 {
+		t.Fatalf("successful live catalog did not produce an eligible owned-route plan: conflicts=%v", plan.Conflicts)
+	}
+	if _, exists := plan.After["remove-me"]; exists {
+		t.Fatalf("identity mapping missing from 404token catalog was retained: %#v", plan.After)
+	}
+	if plan.After["keep-live"] != "keep-live" || plan.After["custom"] != "" || plan.After["fallback"] != "gpt-*" {
+		t.Fatalf("live, missing exact, or wildcard mapping was screened incorrectly: %#v", plan.After)
+	}
+	if len(plan.Changes) != 2 || plan.Changes[0].RuleKind != "live_catalog_absence" || plan.Changes[0].PublicID != "custom" || plan.Changes[1].PublicID != "remove-me" {
+		t.Fatalf("unexpected live-catalog screening changes: %#v", plan.Changes)
+	}
+}
+
+func TestFullScreenReportsUnownedMissingRouteAsConflict(t *testing.T) {
+	source := sourceFixture()
+	plan, err := Normalize(baseRules(), Input{
+		AccountID: source.AccountID, Source: source, CurrentMapping: map[string]string{"remove-me": "remove-me"},
+		LiveModels: []string{"keep-live"}, LiveListAvailable: true, Completeness: CompletenessUnknown,
+		PruneMissingMappings: true,
+	}, state.Account{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.ApplyEligible || plan.After["remove-me"] != "remove-me" || len(plan.Conflicts) != 1 {
+		t.Fatalf("unowned route was not preserved and blocked for review: %#v", plan)
 	}
 }
 

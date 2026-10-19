@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -54,6 +55,7 @@ const (
 	PublishedSnapshotContractStatusIncomplete  = "incomplete_snapshot"
 	publishedSnapshotBuildID                   = "0.2.12"
 	publishedSnapshotAPIContractID             = "admin-catalog-all-v1"
+	knownNoPublishedSnapshotBuildID            = "sub2api-adapted-3130d42a"
 	maxPublishedSnapshotIDs                    = 4096
 	maxPublishedSnapshotIDBytes                = 512
 )
@@ -123,6 +125,11 @@ type Catalog struct {
 type CatalogWarning struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type ModelProbeResult struct {
+	ModelID string
+	Outcome string // succeeded or failed; transport/protocol incompleteness is an error.
 }
 
 type BulkUpdateResult struct {
@@ -280,6 +287,16 @@ func (t snapshotTarget) supported() bool {
 	return t.buildID == publishedSnapshotBuildID && t.apiContractID == publishedSnapshotAPIContractID
 }
 
+func (t snapshotTarget) statusWithoutSnapshot() string {
+	if t.supported() {
+		return PublishedSnapshotContractStatusNotPresent
+	}
+	if t.buildID == knownNoPublishedSnapshotBuildID && t.apiContractID == publishedSnapshotAPIContractID {
+		return PublishedSnapshotContractStatusNotPresent
+	}
+	return PublishedSnapshotContractStatusUnsupported
+}
+
 // ListAllAccounts reads every account through the paginated admin list API.
 // It is intentionally opt-in at the config/workflow layer because list items
 // may include credential-shaped fields even though this client discards them.
@@ -376,6 +393,124 @@ func (c *Client) SyncUpstream(ctx context.Context, id int64) (Catalog, error) {
 		return Catalog{}, err
 	}
 	return out, nil
+}
+
+// ProbeModel uses Sub2API's deployed account-test endpoint to send one text
+// request for an exact model candidate. The native route may apply model
+// mappings and may recover account state after success, so a remapped model is
+// treated as inconclusive. The response body and provider error text are never
+// persisted or returned.
+func (c *Client) ProbeModel(ctx context.Context, id int64, modelID string) (ModelProbeResult, error) {
+	modelID = strings.TrimSpace(modelID)
+	if id <= 0 || !validProbeModelID(modelID) {
+		return ModelProbeResult{}, errors.New("invalid model probe input")
+	}
+	path := "/api/v1/admin/accounts/" + strconv.FormatInt(id, 10) + "/test"
+	if c == nil || c.base == nil || c.http == nil || !allowedRequest(http.MethodPost, path, nil) {
+		return ModelProbeResult{}, errors.New("admin API operation is outside the allowlist")
+	}
+	if len(c.apiKey) == 0 {
+		return ModelProbeResult{}, errors.New("admin API key is not configured")
+	}
+	body, err := json.Marshal(struct {
+		ModelID string `json:"model_id"`
+		Prompt  string `json:"prompt"`
+	}{ModelID: modelID, Prompt: "Reply with OK."})
+	if err != nil {
+		return ModelProbeResult{}, errors.New("model probe request could not be prepared")
+	}
+	defer zero(body)
+	u := *c.base
+	u.Path = path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return ModelProbeResult{}, safeAPIError{category: "request_create"}
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", string(c.apiKey))
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ModelProbeResult{}, safeAPIError{category: "transport"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return ModelProbeResult{}, safeAPIError{status: resp.StatusCode, category: "probe_response"}
+	}
+	limited := &countingReader{r: io.LimitReader(resp.Body, maxResponseBytes+1)}
+	scanner := bufio.NewScanner(limited)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	started := false
+	terminal := ""
+	startedModel := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Model   string `json:"model"`
+			Success bool   `json:"success"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil || event.Type == "" {
+			return ModelProbeResult{}, errors.New("model probe returned malformed SSE")
+		}
+		switch event.Type {
+		case "test_start":
+			if started || terminal != "" || event.Model == "" {
+				return ModelProbeResult{}, errors.New("model probe returned an invalid start event")
+			}
+			if event.Model != modelID {
+				return ModelProbeResult{}, errors.New("model probe started a different model; result is incomplete")
+			}
+			started = true
+			startedModel = event.Model
+		case "error":
+			if !started || terminal != "" {
+				return ModelProbeResult{}, errors.New("model probe returned an invalid error event")
+			}
+			terminal = "failed"
+		case "test_complete":
+			if !started || terminal != "" {
+				return ModelProbeResult{}, errors.New("model probe returned an invalid terminal event")
+			}
+			if startedModel != modelID {
+				return ModelProbeResult{}, errors.New("model probe tested a different model; result is incomplete")
+			}
+			if event.Success {
+				terminal = "succeeded"
+			} else {
+				terminal = "failed"
+			}
+		}
+		if terminal != "" {
+			break
+		}
+	}
+	if scanner.Err() != nil || limited.n > maxResponseBytes {
+		return ModelProbeResult{}, errors.New("model probe response exceeded its safe limit or could not be read")
+	}
+	if terminal == "" {
+		return ModelProbeResult{}, errors.New("model probe stream ended without a terminal event")
+	}
+	return ModelProbeResult{ModelID: modelID, Outcome: terminal}, nil
+}
+
+func validProbeModelID(modelID string) bool {
+	if modelID == "" || len(modelID) > 256 || strings.ContainsAny(modelID, "\r\n\x00") {
+		return false
+	}
+	for _, r := range modelID {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // BulkUpdateMapping is the only supported write method. It intentionally has
@@ -476,6 +611,9 @@ func allowedRequest(method, path string, query url.Values) bool {
 		return true
 	}
 	if method == http.MethodPost && syncPath(path) {
+		return true
+	}
+	if method == http.MethodPost && probePath(path) {
 		return true
 	}
 	return method == http.MethodPost && path == "/api/v1/admin/accounts/bulk-update"
@@ -602,6 +740,14 @@ func syncPath(path string) bool {
 	return accountPath(strings.TrimSuffix(path, suffix))
 }
 
+func probePath(path string) bool {
+	const suffix = "/test"
+	if !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	return accountPath(strings.TrimSuffix(path, suffix))
+}
+
 type countingReader struct {
 	r io.Reader
 	n int64
@@ -699,10 +845,7 @@ func decodeAccount(dec *json.Decoder, out *Account, target *snapshotTarget) erro
 	hasTopLevelMapping := false
 	extraSeen := false
 	if target != nil {
-		out.PublishedSnapshot = &PublishedSnapshot{ContractStatus: PublishedSnapshotContractStatusNotPresent}
-		if !target.supported() {
-			out.PublishedSnapshot.ContractStatus = PublishedSnapshotContractStatusUnsupported
-		}
+		out.PublishedSnapshot = &PublishedSnapshot{ContractStatus: target.statusWithoutSnapshot()}
 	}
 	err := decodeUniqueKnownObject(dec, map[string]func(*json.Decoder) error{
 		"id":                func(d *json.Decoder) error { return d.Decode(&out.ID) },

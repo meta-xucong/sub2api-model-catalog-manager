@@ -1,4 +1,13 @@
-# Official Product Selectability as the Model Eligibility Standard
+# Historical: Official Product Selectability as the Model Eligibility Standard
+
+> **Superseded; do not use as the current eligibility contract.** This document
+> records the earlier API-key catalog and account-selector snapshot design.
+> Current eligibility uses only exact evidence from accepted official web or
+> login products, as described in
+> [`official-product-availability.md`](official-product-availability.md).
+> API-key model lists and API lifecycle sources cannot establish login-product
+> eligibility. Product-scoped retirement cannot remove an ID from a wider
+> accepted-product union unless complete evidence covers that union.
 
 ## Decision
 

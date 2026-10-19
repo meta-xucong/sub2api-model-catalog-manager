@@ -106,14 +106,18 @@ type LifecycleEvidence struct {
 }
 
 type CachedPage struct {
-	URL           string              `json:"url"`
-	Title         string              `json:"title"`
-	ContentSHA256 string              `json:"content_sha256"`
-	FetchedAt     time.Time           `json:"fetched_at"`
-	ETag          string              `json:"etag,omitempty"`
-	LastModified  string              `json:"last_modified,omitempty"`
-	Links         []string            `json:"links,omitempty"`
-	Evidence      []LifecycleEvidence `json:"evidence,omitempty"`
+	URL               string              `json:"url"`
+	Title             string              `json:"title"`
+	ContentSHA256     string              `json:"content_sha256"`
+	FetchedAt         time.Time           `json:"fetched_at"`
+	CatalogTotal      int                 `json:"catalog_total,omitempty"`
+	CatalogPageNo     int                 `json:"catalog_page_no,omitempty"`
+	CatalogPageSize   int                 `json:"catalog_page_size,omitempty"`
+	ETag              string              `json:"etag,omitempty"`
+	LastModified      string              `json:"last_modified,omitempty"`
+	Links             []string            `json:"links,omitempty"`
+	Evidence          []LifecycleEvidence `json:"evidence,omitempty"`
+	AvailableModelIDs []string            `json:"available_model_ids,omitempty"`
 }
 
 type CatalogSnapshot struct {
@@ -153,6 +157,7 @@ type StartupSyncResult struct {
 type StartupSyncOptions struct {
 	Offline           bool
 	CacheDir          string
+	ArkCredentialFile string
 	LookupEnv         func(string) (string, bool)
 	userCacheDir      func() (string, error)
 	proxyResolver     func(*http.Request) (*url.URL, error)
@@ -232,6 +237,33 @@ type LifecycleExclusion struct {
 	ContentSHA256 string    `json:"content_sha256"`
 	Excerpt       string    `json:"excerpt"`
 	OwnerRule     bool      `json:"owner_rule,omitempty"`
+}
+
+type AvailableModelCatalog struct {
+	SourceID      string    `json:"source_id"`
+	SourceIDs     []string  `json:"source_ids,omitempty"`
+	Provider      string    `json:"provider"`
+	Scope         string    `json:"scope"`
+	ModelIDs      []string  `json:"model_ids"`
+	Complete      bool      `json:"complete_accepted_union"`
+	SourceURL     string    `json:"source_url"`
+	SourceTitle   string    `json:"source_title"`
+	RetrievedAt   time.Time `json:"retrieved_at"`
+	ContentSHA256 string    `json:"content_sha256"`
+}
+
+// ProductModelAvailability records whether exact official product evidence
+// permits a model ID to enter an automatic identity mapping. A missing ID on
+// an incomplete page is insufficient evidence, never a negative decision.
+type ProductModelAvailability struct {
+	ModelID       string    `json:"model_id"`
+	Provider      string    `json:"provider,omitempty"`
+	Status        string    `json:"status"`
+	MatchKind     string    `json:"match_kind"`
+	SourceIDs     []string  `json:"source_ids,omitempty"`
+	SourceURLs    []string  `json:"source_urls,omitempty"`
+	ContentSHA256 []string  `json:"content_sha256,omitempty"`
+	RetrievedAt   time.Time `json:"retrieved_at,omitempty"`
 }
 
 type NameShapeCandidate struct {

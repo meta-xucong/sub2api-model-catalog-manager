@@ -22,6 +22,7 @@ type AdminAPI interface {
 	ListAllAccounts(context.Context) ([]adminapi.AccountSummary, error)
 	Account(context.Context, int64) (adminapi.Account, error)
 	SyncUpstream(context.Context, int64) (adminapi.Catalog, error)
+	ProbeModel(context.Context, int64, string) (adminapi.ModelProbeResult, error)
 	BulkUpdateMapping(context.Context, int64, map[string]string) (adminapi.BulkUpdateResult, error)
 	Close()
 }

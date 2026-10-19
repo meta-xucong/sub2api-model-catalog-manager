@@ -361,6 +361,28 @@ func TestAccountWithPublishedSnapshotMatchesSyntheticFixture(t *testing.T) {
 	}
 }
 
+func TestKnownAdaptedTargetWithoutPublishedSnapshotIsNotPresent(t *testing.T) {
+	// The deployed 3130d42a target stores capability data under
+	// upstream_model_metadata, not the published upstream_model_refresh contract.
+	body := []byte(`{"code":0,"data":{"id":8,"platform":"openai","type":"apikey","credentials":{"model_mapping":{}},"extra":{"upstream_model_metadata":{"source":"upstream","synced_at":"2026-10-19T00:00:00Z","models":{"must-not-become-catalog-id":{"reasoning":true}}}}}}`)
+	got := readPublishedSnapshotForTest(t, body, knownNoPublishedSnapshotBuildID, publishedSnapshotAPIContractID)
+	if got.ContractStatus != PublishedSnapshotContractStatusNotPresent {
+		t.Fatalf("contract status = %q, want %q", got.ContractStatus, PublishedSnapshotContractStatusNotPresent)
+	}
+	if got.RawCount != 0 || got.PublicCount != 0 || len(got.RawModels) != 0 || len(got.PublicModels) != 0 || len(got.PublicToUpstream) != 0 {
+		t.Fatalf("capability metadata was treated as a published catalog: %#v", got)
+	}
+
+	unknown := readPublishedSnapshotForTest(t, body, "unreviewed-build", publishedSnapshotAPIContractID)
+	if unknown.ContractStatus != PublishedSnapshotContractStatusUnsupported {
+		t.Fatalf("unknown build status = %q, want %q", unknown.ContractStatus, PublishedSnapshotContractStatusUnsupported)
+	}
+	wrongContract := readPublishedSnapshotForTest(t, body, knownNoPublishedSnapshotBuildID, "admin-catalog-v1")
+	if wrongContract.ContractStatus != PublishedSnapshotContractStatusUnsupported {
+		t.Fatalf("wrong API contract status = %q, want %q", wrongContract.ContractStatus, PublishedSnapshotContractStatusUnsupported)
+	}
+}
+
 func TestPublishedSnapshotFailsClosedWithoutCopyingModelIDs(t *testing.T) {
 	fixture, err := os.ReadFile("testdata/upstream_model_refresh_v1_synthetic.json")
 	if err != nil {
@@ -622,6 +644,11 @@ func TestRedirectIsNotFollowedAndUnsafePathsAreBlocked(t *testing.T) {
 		{http.MethodPost, "/api/v1/admin/accounts/42/models/sync-upstream-preview"},
 		{http.MethodPost, "/api/v1/admin/accounts/models/sync-upstream-preview"},
 		{http.MethodPost, "/api/v1/admin/accounts/042/models/sync-upstream"},
+		{http.MethodGet, "/api/v1/admin/accounts/42/test"},
+		{http.MethodPost, "/api/v1/admin/accounts/042/test"},
+		{http.MethodPost, "/api/v1/admin/accounts/42/test/extra"},
+		{http.MethodPost, "/api/v1/admin/accounts/abc/test"},
+		{http.MethodPost, "/api/v1/admin/accounts/42/test-anything"},
 		{http.MethodPost, "/v1/responses"},
 		{http.MethodPost, "/v1/responses/compact"},
 		{http.MethodPost, "/v1/chat/completions"},
@@ -707,5 +734,60 @@ func TestNewPinsTrustedOriginAndRequestsRequireKey(t *testing.T) {
 	}
 	if requests != 0 {
 		t.Fatalf("request without an API key reached transport: %d", requests)
+	}
+}
+
+func TestProbeModelUsesDeployedAccountTestEndpointAndParsesTerminalSSE(t *testing.T) {
+	for _, tc := range []struct{ name, stream, want string }{
+		{"success", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":true}\n\n", "succeeded"},
+		{"terminal_failure", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":false}\n\n", "failed"},
+		{"provider_failure", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"error\",\"message\":\"secret provider text\"}\n\n", "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newHandlerClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/42/test" {
+					t.Errorf("unexpected probe request: %s %s", r.Method, r.URL.Path)
+				}
+				assertAPIKey(t, r)
+				var body map[string]string
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 2 || body["model_id"] != "gpt-5.5" || body["prompt"] != "Reply with OK." {
+					t.Errorf("request did not contain the exact model ID and fixed short prompt: %#v err=%v", body, err)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.stream)
+			}))
+			if err := client.SetAPIKey([]byte("test-admin-key")); err != nil {
+				t.Fatal(err)
+			}
+			got, err := client.ProbeModel(context.Background(), 42, "gpt-5.5")
+			if err != nil || got.ModelID != "gpt-5.5" || got.Outcome != tc.want {
+				t.Fatalf("probe result = %#v, err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestProbeModelRejectsMismatchedModelAndIncompleteSSE(t *testing.T) {
+	for _, tc := range []struct {
+		stream  string
+		wantErr bool
+	}{
+		{stream: "data: {\"type\":\"test_start\",\"model\":\"gpt-5.4\"}\n\ndata: {\"type\":\"test_complete\",\"success\":true}\n\n", wantErr: true},
+		{stream: "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\n", wantErr: true},
+	} {
+		client := newHandlerClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, tc.stream)
+		}))
+		if err := client.SetAPIKey([]byte("test-admin-key")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := client.ProbeModel(context.Background(), 42, "gpt-5.5")
+		if tc.wantErr && err == nil {
+			t.Fatal("incomplete probe stream was accepted")
+		}
+		if !tc.wantErr && (err != nil || got.Outcome != "failed") {
+			t.Fatalf("terminal provider failure was not preserved: result=%#v err=%v", got, err)
+		}
 	}
 }

@@ -99,7 +99,7 @@ func TestOfficialSnapshotOverlaysConfiguredAPIScopeWithoutChangingRulesApproval(
 	}
 }
 
-func TestDynamicSnapshotDigestIsBoundAcrossDiscoveryAndApplyPreflight(t *testing.T) {
+func TestFullScreenUses404tokenCatalogWithoutOfficialSnapshot(t *testing.T) {
 	cfg, _, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable"})
 	rules, err := catalog.LoadRules(cfg.RulesFile)
 	if err != nil {
@@ -112,21 +112,7 @@ func TestDynamicSnapshotDigestIsBoundAcrossDiscoveryAndApplyPreflight(t *testing
 		Scope: "official-account:test-owner-account", Provider: "openai-api", Product: "api",
 		Credential: config.CredentialConfig{WindowsCredentialTarget: "official-api-test"},
 	}}
-	cfg.ApplyMode = "approved_rules"
-	_, approvedRulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ApprovedRulesSHA256 = approvedRulesHash
-	models := `{"data":[{"id":"stable"}]}`
-	readSecret := func(config.CredentialConfig) (securecred.Value, error) {
-		return securecred.Value{APIKey: []byte("test-api-key")}, nil
-	}
-	doer := officialSnapshotDoer(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(models)), Header: make(http.Header)}, nil
-	})
-	snapshotPath := cfg.OfficialSelectabilityFile()
-	if err := officialselectability.Refresh(context.Background(), snapshotPath, cfg.OfficialSelectabilitySources, readSecret, doer, func() time.Time { return now }); err != nil {
+	if err := os.Remove(cfg.OfficialSelectabilityFile()); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 	discoverer := Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}
@@ -136,29 +122,15 @@ func TestDynamicSnapshotDigestIsBoundAcrossDiscoveryAndApplyPreflight(t *testing
 	}
 	discovery, err := discoverer.DiscoverPrepared(context.Background(), cfg, discoveryPreflight)
 	if err != nil || discovery.Plan == nil {
-		t.Fatalf("dynamic official snapshot did not produce a discovery plan: plan=%#v err=%v", discovery.Plan, err)
+		t.Fatalf("404token catalog did not produce a discovery plan without official evidence: plan=%#v err=%v", discovery.Plan, err)
 	}
-	if len(discovery.Plan.Accounts) == 0 || discoveryPreflight.OfficialSelectabilitySHA256 == "" || discovery.Plan.Accounts[0].OfficialSelectabilitySHA256 == "" {
-		t.Fatal("discovery did not bind the official snapshot digest into its preflight and plan")
+	if len(discovery.Plan.Accounts) == 0 || discoveryPreflight.OfficialSelectabilitySHA256 != "" || discovery.Plan.Accounts[0].OfficialSelectabilitySHA256 != "" {
+		t.Fatal("full-screen discovery still depends on an official selectability snapshot")
 	}
-	currentNow := now
-	applier := Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return currentNow }, FullScreen: true}
-	applyPreflight, err := applier.Preflight(cfg, *discovery.Plan, discovery.PlanSHA256, "", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if applyPreflight.OfficialSelectabilitySHA256 != discoveryPreflight.OfficialSelectabilitySHA256 {
-		t.Fatal("apply preflight was computed against a different official snapshot")
-	}
-	models = `{"data":[{"id":"different-snapshot"}]}`
-	currentNow = now.Add(time.Minute)
-	if err := officialselectability.Refresh(context.Background(), snapshotPath, cfg.OfficialSelectabilitySources, readSecret, doer, func() time.Time { return currentNow }); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := applier.ApplyPrepared(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, "", true, applyPreflight); err == nil {
-		t.Fatal("apply proceeded after the bound official snapshot changed")
+	if _, err := os.Stat(cfg.OfficialSelectabilityFile()); !os.IsNotExist(err) {
+		t.Fatalf("full-screen discovery unexpectedly created official evidence: err=%v", err)
 	}
 	if len(api.bulkCalls) != 0 {
-		t.Fatalf("snapshot drift reached the mapping write: %v", api.bulkCalls)
+		t.Fatalf("discovery attempted to write model mappings: %v", api.bulkCalls)
 	}
 }

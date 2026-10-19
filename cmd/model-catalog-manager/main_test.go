@@ -753,14 +753,14 @@ func TestFullScreenPreviewOnlyDoesNotApplyEvenWithMatchingApproval(t *testing.T)
 	stdout, err := captureStdout(t, func() error {
 		return runAutomaticWith([]string{"--config", configPath, "--full-screen", "--preview-only"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
 	})
-	if err == nil {
-		t.Fatal("preview-only full-screen result should not report success")
+	if err != nil {
+		t.Fatalf("successful preview-only full-screen run returned an error: %v", err)
 	}
 	if api.syncCalls != 1 || api.bulkCalls != 0 || api.statusCalls != 1 {
 		t.Fatalf("preview-only full screen crossed the mapping-write boundary: sync=%d bulk=%d status=%d", api.syncCalls, api.bulkCalls, api.statusCalls)
 	}
 	var terminal fullScreenResult
-	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "failed" || terminal.ReasonCode != "configuration_invalid" || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "preview" || terminal.ReasonCode != "preview_only" || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
 		t.Fatalf("preview-only full-screen result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
 	}
 }
@@ -843,6 +843,7 @@ func TestFullScreenPartialAfterVerifiedWritePreservesNativeRefreshGateReason(t *
 			account2 := account1
 			account2.ID = 9002
 			api.accounts = map[int64]adminapi.Account{account1.ID: account1, account2.ID: account2}
+			api.catalog.Models = append(api.catalog.Models, "new-model")
 			api.catalogs = map[int64]adminapi.Catalog{
 				account1.ID: api.catalog,
 				account2.ID: api.catalog,
@@ -1054,6 +1055,11 @@ func fullScreenFixture(t *testing.T, mismatch bool) (string, *mainWorkflowAPI) {
 		t.Fatal(err)
 	}
 	api.status.RunStatus = "partial_failure"
+	// Full-screen absence pruning uses the native 404token list as its source
+	// of truth. Keep the fixture's existing unmanaged mapping in that list so
+	// these apply-path tests exercise the approved addition instead of the
+	// intentional unmanaged-missing-ID conflict boundary.
+	api.catalog.Models = append(api.catalog.Models, "keep")
 	return configPath, api
 }
 
@@ -1137,6 +1143,9 @@ func (m *mainWorkflowAPI) SyncUpstream(_ context.Context, id int64) (adminapi.Ca
 		return catalog, nil
 	}
 	return m.catalog, nil
+}
+func (m *mainWorkflowAPI) ProbeModel(_ context.Context, id int64, modelID string) (adminapi.ModelProbeResult, error) {
+	return adminapi.ModelProbeResult{ModelID: modelID, Outcome: "succeeded"}, nil
 }
 func (m *mainWorkflowAPI) BulkUpdateMapping(_ context.Context, id int64, mapping map[string]string) (adminapi.BulkUpdateResult, error) {
 	m.bulkCalls++

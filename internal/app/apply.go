@@ -115,7 +115,7 @@ func (a Applier) Preflight(cfg config.Config, plan catalog.ApprovalPlan, planSHA
 	if plan.AccountScope != cfg.AccountScopeValue() {
 		return prepared, errors.New("apply blocked: plan account scope differs from current configuration")
 	}
-	rules, rulesHash, officialHash, err := loadRulesWithOfficialSnapshot(cfg, now().UTC())
+	rules, rulesHash, officialHash, err := loadRulesForRun(cfg, a.FullScreen, now().UTC())
 	if err != nil {
 		return prepared, err
 	}
@@ -178,12 +178,14 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 		return result, err
 	}
 	defer lock.Release()
-	officialLock, err := acquireOfficialSelectabilityLock(cfg)
-	if err != nil {
-		return result, errors.New("apply blocked: official selectability evidence is being refreshed")
-	}
-	if officialLock != nil {
-		defer officialLock.Release()
+	if !a.FullScreen {
+		officialLock, err := acquireOfficialSelectabilityLock(cfg)
+		if err != nil {
+			return result, errors.New("apply blocked: official selectability evidence is being refreshed")
+		}
+		if officialLock != nil {
+			defer officialLock.Release()
+		}
 	}
 	statePath := filepath.Join(cfg.StateDir, "state.json")
 	currentStateHash, err := optionalStateHash(statePath)
@@ -194,7 +196,7 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 	if a.Now != nil {
 		checkNow = a.Now().UTC()
 	}
-	if _, _, currentOfficialHash, officialErr := loadRulesWithOfficialSnapshot(cfg, checkNow); officialErr != nil || currentOfficialHash != prepared.OfficialSelectabilitySHA256 {
+	if _, _, currentOfficialHash, officialErr := loadRulesForRun(cfg, a.FullScreen, checkNow); officialErr != nil || currentOfficialHash != prepared.OfficialSelectabilitySHA256 {
 		return result, errors.New("apply stopped: official selectability evidence changed or expired after preflight")
 	}
 	localState := prepared.LocalState
@@ -261,6 +263,16 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 				return result, errors.New("apply blocked: plan includes an account outside the current inventory")
 			}
 		}
+		if len(plan.ModelProbeDecisions) > 0 {
+			if plan.AccountScope != "all" {
+				return result, errors.New("apply blocked: exact-model probing requires an all-account approval plan")
+			}
+			if scopeErr := verifyModelProbeScope(ctx, client, inventory, plan.ModelProbeDecisions); scopeErr != nil {
+				return result, errors.New("apply blocked: exact-model account scope changed or could not be verified")
+			}
+		}
+	} else if len(plan.ModelProbeDecisions) > 0 {
+		return result, errors.New("apply blocked: exact-model probing requires a complete all-account scope")
 	}
 	preparedRemote := make([]preparedApply, 0, len(plan.Accounts))
 	seen := map[int64]bool{}
@@ -325,8 +337,11 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 			CurrentMapping: account.ModelMapping, ManagedMappings: local.ManagedMappings,
 			LiveModels: p.CatalogModels, LiveListAvailable: p.LiveListAvailable,
 			Completeness: complete, CompletenessProfileID: profileID, DirectoryHash: p.DirectoryHash,
-			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: nil,
-			RequireOfficialSelectability: true, OfficialSelectabilityScope: profile.OfficialSelectabilityScope, Now: now().UTC(),
+			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: p.LifecycleExclusions,
+			ProductAvailabilityEnforced: p.ProductAvailabilityEnforced, ProductAvailability: append([]catalog.ProductModelAvailability{}, p.ProductAvailability...),
+			RequireOfficialSelectability: false,
+			PruneMissingMappings:         false,
+			Now:                          now().UTC(),
 		}, priorForNormalize)
 		if err != nil {
 			return result, err
@@ -438,6 +453,57 @@ func (a Applier) ApplyPrepared(ctx context.Context, cfg config.Config, plan cata
 	return result, nil
 }
 
+func verifyModelProbeScope(ctx context.Context, client AdminAPI, inventory []adminapi.AccountSummary, decisions []catalog.ModelProbeDecision) error {
+	approved := make(map[string]map[int64]bool, len(decisions))
+	current := make(map[string]map[int64]bool, len(decisions))
+	for _, decision := range decisions {
+		key := catalog.ModelProbeKey(decision.Provider, decision.ModelID)
+		approved[key] = make(map[int64]bool, len(decision.ScopeAccounts))
+		current[key] = map[int64]bool{}
+		for _, scope := range decision.ScopeAccounts {
+			approved[key][scope.AccountID] = true
+		}
+		for _, outcome := range decision.Accounts {
+			if !approved[key][outcome.AccountID] {
+				return errors.New("model-probe participant is outside its approved account scope")
+			}
+		}
+	}
+	for _, summary := range inventory {
+		account, err := client.Account(ctx, summary.ID)
+		if err != nil || account.ID != summary.ID || account.Status == "" {
+			return errors.New("current account state is incomplete")
+		}
+		if account.Status != "active" || account.ParentAccountID != nil {
+			continue
+		}
+		if !account.HasModelMapping() {
+			return errors.New("active account mapping is missing")
+		}
+		for _, decision := range decisions {
+			key := catalog.ModelProbeKey(decision.Provider, decision.ModelID)
+			for _, upstreamID := range account.ModelMapping {
+				if upstreamID == decision.ModelID {
+					current[key][account.ID] = true
+					break
+				}
+			}
+		}
+	}
+	for _, decision := range decisions {
+		key := catalog.ModelProbeKey(decision.Provider, decision.ModelID)
+		if len(current[key]) != len(approved[key]) {
+			return errors.New("current exact-model account set changed")
+		}
+		for accountID := range current[key] {
+			if !approved[key][accountID] {
+				return errors.New("current exact-model account set changed")
+			}
+		}
+	}
+	return nil
+}
+
 type preparedApply struct {
 	plan          catalog.Plan
 	beforeAccount adminapi.Account
@@ -448,7 +514,14 @@ func snapshotMatches(snapshot *state.CatalogSnapshot, p catalog.Plan) bool {
 }
 
 func samePlanDelta(a, b catalog.Plan) bool {
-	return a.AccountID == b.AccountID && a.SourceFingerprint == b.SourceFingerprint && a.BeforeHash == b.BeforeHash && a.DirectoryHash == b.DirectoryHash && a.RulesHash == b.RulesHash && a.Completeness == b.Completeness && a.LiveListAvailable == b.LiveListAvailable && a.ApplyEligible == b.ApplyEligible && a.SourceIdentityAddPolicy == b.SourceIdentityAddPolicy && a.IdentityCatalogPolicy == b.IdentityCatalogPolicy && a.CompletenessProfileID == b.CompletenessProfileID && sameStringSet(a.LifecycleScopes, b.LifecycleScopes) && a.LifecycleEvidenceSHA256 == b.LifecycleEvidenceSHA256 && sameLifecycleExclusions(a.LifecycleExclusions, b.LifecycleExclusions) && a.OfficialSelectabilityScope == b.OfficialSelectabilityScope && a.OfficialSelectabilitySHA256 == b.OfficialSelectabilitySHA256 && a.OfficialSelectabilityObservedAt.Equal(b.OfficialSelectabilityObservedAt) && a.OfficialSelectabilityExpiresAt.Equal(b.OfficialSelectabilityExpiresAt) && reflect.DeepEqual(a.Before, b.Before) && reflect.DeepEqual(a.After, b.After) && reflect.DeepEqual(a.AbsenceCountsBefore, b.AbsenceCountsBefore) && reflect.DeepEqual(a.AbsenceCountsAfter, b.AbsenceCountsAfter) && reflect.DeepEqual(a.Changes, b.Changes) && reflect.DeepEqual(a.Conflicts, b.Conflicts) && reflect.DeepEqual(a.UnreviewedModels, b.UnreviewedModels) && reflect.DeepEqual(a.CatalogModels, b.CatalogModels) && reflect.DeepEqual(a.CatalogWarningCodes, b.CatalogWarningCodes)
+	return a.AccountID == b.AccountID && a.SourceFingerprint == b.SourceFingerprint && a.BeforeHash == b.BeforeHash && a.DirectoryHash == b.DirectoryHash && a.RulesHash == b.RulesHash && a.Completeness == b.Completeness && a.LiveListAvailable == b.LiveListAvailable && a.ApplyEligible == b.ApplyEligible && a.SourceIdentityAddPolicy == b.SourceIdentityAddPolicy && a.IdentityCatalogPolicy == b.IdentityCatalogPolicy && a.CompletenessProfileID == b.CompletenessProfileID && sameStringSet(a.LifecycleScopes, b.LifecycleScopes) && a.LifecycleEvidenceSHA256 == b.LifecycleEvidenceSHA256 && sameLifecycleExclusions(a.LifecycleExclusions, b.LifecycleExclusions) && a.ProductAvailabilityEnforced == b.ProductAvailabilityEnforced && a.ProductAvailabilitySHA256 == b.ProductAvailabilitySHA256 && sameProductAvailability(a.ProductAvailability, b.ProductAvailability) && a.OfficialSelectabilityScope == b.OfficialSelectabilityScope && a.OfficialSelectabilitySHA256 == b.OfficialSelectabilitySHA256 && a.OfficialSelectabilityObservedAt.Equal(b.OfficialSelectabilityObservedAt) && a.OfficialSelectabilityExpiresAt.Equal(b.OfficialSelectabilityExpiresAt) && reflect.DeepEqual(a.Before, b.Before) && reflect.DeepEqual(a.After, b.After) && reflect.DeepEqual(a.AbsenceCountsBefore, b.AbsenceCountsBefore) && reflect.DeepEqual(a.AbsenceCountsAfter, b.AbsenceCountsAfter) && reflect.DeepEqual(a.Changes, b.Changes) && reflect.DeepEqual(a.Conflicts, b.Conflicts) && reflect.DeepEqual(a.UnreviewedModels, b.UnreviewedModels) && reflect.DeepEqual(a.CatalogModels, b.CatalogModels) && reflect.DeepEqual(a.CatalogWarningCodes, b.CatalogWarningCodes)
+}
+
+func sameProductAvailability(a, b []catalog.ProductModelAvailability) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 func sameStringSet(a, b []string) bool {

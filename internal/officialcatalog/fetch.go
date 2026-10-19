@@ -14,31 +14,52 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	StartupSyncTimeout  = 60 * time.Second
-	ProviderSyncTimeout = 10 * time.Second
-	MaxHTTPGets         = 102
-	MaxRedirects        = 2
-	MaxAlibabaNotices   = 16
-	MaxXAIMigrations    = 8
-	MaxParsedLinks      = 4096
+	StartupSyncTimeout     = 60 * time.Second
+	ProviderSyncTimeout    = 10 * time.Second
+	MaxHTTPGets            = 102
+	MaxRedirects           = 2
+	MaxAlibabaNotices      = 16
+	MaxXAIMigrations       = 8
+	MaxXAIGrokNewsArticles = 64
+	MaxParsedLinks         = 4096
 )
 
 var sourceOrder = []string{"openai", "anthropic", "deepseek", "alibaba", "xai"}
 
 type sourceSpec struct {
-	id          string
-	provider    string
-	scope       string
-	rootURL     string
-	limitation  string
-	maxBody     int64
-	maxChildren int
+	id       string
+	provider string
+	scope    string
+	adapter  string
+	// cacheScope isolates account-scoped catalogs while keeping public source identity stable.
+	cacheScope string
+	// productSurface distinguishes accepted user-facing products within a
+	// provider. Lifecycle on one surface must not cancel a positive on another.
+	productSurface    string
+	rootURL           string
+	limitation        string
+	maxBody           int64
+	maxChildren       int
+	catalog           bool
+	catalogMayBeEmpty bool
+	// completeAcceptedUnion is true only when this source is a complete current
+	// catalog covering every accepted web/login product for this vendor.
+	completeAcceptedUnion bool
+	// versionFloorCatalog is an official signed-in product listing whose lowest
+	// canonical model version may be used to retire older versions of that same
+	// model family. It does not make newer or differently surfaced IDs available.
+	versionFloorCatalog bool
+	// lifecycleCoversAcceptedUnion is true only when lifecycle statements on
+	// this source explicitly cover every accepted web/login product for the
+	// vendor. A product-specific notice must leave it false.
+	lifecycleCoversAcceptedUnion bool
 }
 
 var sourceManifest = []sourceSpec{
@@ -47,11 +68,19 @@ var sourceManifest = []sourceSpec{
 	{id: "deepseek-api-updates", provider: "deepseek", scope: "api", rootURL: "https://api-docs.deepseek.com/updates/", limitation: "Only explicit lifecycle notices on the official API change log; unmentioned IDs remain unknown.", maxBody: 2 << 20},
 	{id: "alibaba-model-deprecation", provider: "alibaba", scope: "api", rootURL: "https://help.aliyun.com/zh/model-studio/model-depreciation", limitation: "Official Model Studio lifecycle notices only; proxy routes may differ.", maxBody: 2 << 20, maxChildren: MaxAlibabaNotices},
 	{id: "xai-api-release-notes", provider: "xai", scope: "api", rootURL: "https://docs.x.ai/developers/release-notes", limitation: "Official xAI API release notes only; compatibility redirects do not prove third-party routing.", maxBody: 2 << 20, maxChildren: MaxXAIMigrations},
-	{id: "openai-codex-models", provider: "openai", scope: "openai_codex_chatgpt_login", rootURL: "https://developers.openai.com/codex/models", limitation: "Codex ChatGPT-sign-in product lifecycle only; API-key endpoints are a separate scope.", maxBody: 2 << 20},
-	{id: "openai-codex-changelog", provider: "openai", scope: "openai_codex_chatgpt_login", rootURL: "https://learn.chatgpt.com/docs/changelog", limitation: "Codex/ChatGPT product lifecycle only; account- or workspace-specific availability is not global retirement.", maxBody: 2 << 20},
-	{id: "anthropic-claude-release-notes", provider: "anthropic", scope: "anthropic_claude_code_login", rootURL: "https://support.claude.com/en/articles/12138966-release-notes", limitation: "Claude/Claude Code normal-sign-in release notes only; matching API retirement is separate evidence.", maxBody: 2 << 20},
-	{id: "kimi-code-models", provider: "kimi", scope: "kimi_code_login", rootURL: "https://www.kimi.com/help/kimi-code/models", limitation: "Kimi Code positive model/plan listing only; page absence is not retirement evidence.", maxBody: 2 << 20},
-	{id: "kimi-code-whats-new", provider: "kimi", scope: "kimi_code_login", rootURL: "https://www.kimi.com/code/docs/en/kimi-code/whats-new.html", limitation: "Kimi Code explicit lifecycle notices only; product/plan-specific limits are not global retirement.", maxBody: 2 << 20},
+	{id: "openai-codex-models", provider: "openai", scope: "openai_codex_chatgpt_login", productSurface: "openai_codex", rootURL: "https://developers.openai.com/codex/models", limitation: "Codex with ChatGPT sign-in model list; not an exhaustive ChatGPT web catalog or API-key catalog.", maxBody: 2 << 20, catalog: true, versionFloorCatalog: true},
+	{id: "openai-chatgpt-models", provider: "openai", scope: "openai_codex_chatgpt_login", productSurface: "openai_chatgpt_web", rootURL: "https://help.openai.com/en/articles/20001354-gpt-6-and-other-models-in-chatgpt", limitation: "ChatGPT signed-in web model guide; exact visible GPT family names only, with no exhaustive selector inventory or API-key catalog.", maxBody: 2 << 20, catalog: true},
+	{id: "openai-chatgpt-gpt6-announcement", provider: "openai", scope: "openai_codex_chatgpt_login", productSurface: "openai_chatgpt_web", rootURL: "https://openai.com/index/gpt-6-for-everyone/", limitation: "Positive ChatGPT web launch evidence for GPT-6 only; partial product announcement, not a complete selector inventory or API-key catalog.", maxBody: 2 << 20, catalog: true},
+	{id: "openai-cross-product-lifecycle-v2", provider: "openai", scope: "openai_codex_chatgpt_login", productSurface: "openai_chatgpt_web", rootURL: "https://learn.chatgpt.com/docs/changelog", limitation: "Accepted-union retirement only when one explicit official sentence retires an exact model from both ChatGPT web and Codex; Codex-only, product-specific, or API-only notices do not establish union retirement.", maxBody: 2 << 20, lifecycleCoversAcceptedUnion: true},
+	{id: "anthropic-claude-code-models", provider: "anthropic", scope: "anthropic_claude_code_login", productSurface: "anthropic_claude_code", rootURL: "https://support.claude.com/en/articles/11940350-claude-code-model-configuration", limitation: "Claude Code supported-model list for normal sign-in; not an exhaustive consumer Claude selector or API-key catalog.", maxBody: 2 << 20, catalog: true},
+	{id: "anthropic-claude-web-models", provider: "anthropic", scope: "anthropic_claude_code_login", productSurface: "anthropic_claude_consumer", rootURL: "https://support.claude.com/en/articles/8606394-how-large-is-the-context-window-on-paid-claude-plans", limitation: "Paid Claude consumer chat model names; exact IDs are admitted only through explicit aliases cross-checked against the Claude Code model configuration list.", maxBody: 2 << 20, catalog: true},
+	{id: "anthropic-claude-release-notes", provider: "anthropic", scope: "anthropic_claude_code_login", productSurface: "anthropic_claude_consumer", rootURL: "https://support.claude.com/en/articles/12138966-release-notes", limitation: "Consumer Claude release notes; product/plan-specific retirements do not establish Claude Code or API availability.", maxBody: 2 << 20},
+	{id: "kimi-code-models", provider: "kimi", scope: "kimi_code_login", productSurface: "kimi_code", rootURL: "https://www.kimi.com/en/help/kimi-code/models", limitation: "Kimi Code positive model/plan listing only; page absence is not evidence about Kimi chat.", maxBody: 2 << 20, catalog: true},
+	{id: "kimi-web-models", provider: "kimi", scope: "kimi_code_login", productSurface: "kimi_web", rootURL: "https://www.kimi.com/en/help/new-user-guide/agentic-chat", limitation: "Kimi web selector names; only the K3 display name has a currently defensible exact ID crosswalk, while other labels remain unclassified.", maxBody: 2 << 20, catalog: true},
+	{id: "kimi-code-whats-new", provider: "kimi", scope: "kimi_code_login", productSurface: "kimi_code", rootURL: "https://www.kimi.com/code/docs/en/kimi-code/whats-new.html", limitation: "Kimi Code lifecycle notices only; product/plan-specific limits are not global retirement.", maxBody: 2 << 20},
+	{id: "volcengine-ark-account-models", provider: "volcengine", scope: "volcengine_ark_account_activation", adapter: "volcengine_ark", rootURL: "https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01", limitation: "Current Ark account activation inventory only; exact IDs are scoped to the configured AK/SK account, not a global manufacturer or consumer-product catalog.", maxBody: 2 << 20, catalog: true, catalogMayBeEmpty: true},
+	{id: "alibaba-model-studio-models", provider: "alibaba", scope: "alibaba_model_studio_beijing_api_catalog", adapter: "alibaba_model_studio", rootURL: "https://ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com/api/v1/models?page_no=1&page_size=200", limitation: "Official Beijing Model Studio API model catalog for the configured workspace; this is regional API catalog evidence, not web-product availability or account inference entitlement.", maxBody: 2 << 20, maxChildren: 99, catalog: true},
+	{id: "xai-grok-web-models", provider: "xai", scope: "xai_grok_web_login", productSurface: "xai_grok_web", rootURL: "https://x.ai/news/grok-4-5-everywhere", limitation: "Positive Grok web evidence from the official Grok 4.5 web announcement; the x.ai/news index and sitemap are Cloudflare-blocked from this runtime, so future announcements cannot be discovered automatically yet. Never an API or Grok Build catalog.", maxBody: 2 << 20, maxChildren: MaxXAIGrokNewsArticles, catalog: true, versionFloorCatalog: true},
 }
 
 var (
@@ -59,6 +88,12 @@ var (
 	spaceRE                  = regexp.MustCompile(`[\s\x{00a0}]+`)
 	scriptRE                 = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>|<nav\b[^>]*>.*?</nav>|<footer\b[^>]*>.*?</footer>`)
 	titleRE                  = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title>`)
+	mainArticleRE            = regexp.MustCompile(`(?is)<article\b[^>]*id=["']mainContent["'][^>]*>(.*?)</article>`)
+	openAIChangelogEntry     = regexp.MustCompile(`(?is)<li\b([^>]*)>(.*?)</li>`)
+	openAIChangelogProducts  = regexp.MustCompile(`(?is)\bdata-products=["']([^"']*)["']`)
+	openAIChangelogHeading   = regexp.MustCompile(`(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]>`)
+	openAIChangelogFullDate  = regexp.MustCompile(`(?i)\b(?:on|effective(?:\s+on)?)\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})`)
+	openAIChangelogShortDate = regexp.MustCompile(`(?i)\s+on\s+[A-Z][a-z]+\s+\d{1,2}\s*$`)
 	h1RE                     = regexp.MustCompile(`(?is)<h1\b[^>]*>(.*?)</h1>`)
 	headingRE                = regexp.MustCompile(`(?is)<h[1-6]\b[^>]*>(.*?)</h[1-6]>`)
 	rowRE                    = regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
@@ -67,6 +102,9 @@ var (
 	listItemRE               = regexp.MustCompile(`(?is)<li\b[^>]*>(.*?)</li>`)
 	listBlockRE              = regexp.MustCompile(`(?is)<(?:ul|ol)\b[^>]*>.*?</(?:ul|ol)>`)
 	linkRE                   = regexp.MustCompile(`(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>`)
+	metaTagRE                = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	metaNameRE               = regexp.MustCompile(`(?is)\b(?:name|property)\s*=\s*["']([^"']+)["']`)
+	metaContentRE            = regexp.MustCompile(`(?is)\bcontent\s*=\s*["']([^"']*)["']`)
 	modelTokenRE             = regexp.MustCompile(`\b[a-zA-Z][a-zA-Z0-9]*(?:[._:-][a-zA-Z0-9]+)+\b`)
 	dateISORe                = regexp.MustCompile(`\b(20\d{2}-\d{2}-\d{2})\b`)
 	dateUSRe                 = regexp.MustCompile(`(?i)\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+([0-3]?\d),?\s+(20\d{2})\b`)
@@ -76,6 +114,7 @@ var (
 	aliyunID                 = regexp.MustCompile(`^[0-9]+$`)
 	alibabaLifecycleAnchorRE = regexp.MustCompile(`不再提供|停止服务|下线|退役|停服`)
 	xaiPath                  = regexp.MustCompile(`^/developers/migration/[a-z0-9-]+$`)
+	xaiNewsPath              = regexp.MustCompile(`^/news/[a-z0-9-]+$`)
 )
 
 const alibabaBulletinRenderer = "https://t.aliyun.com/abs/bulletin/bulletinDetail"
@@ -151,6 +190,8 @@ func validateConfiguredProxy(resolve func(*http.Request) (*url.URL, error)) erro
 		for i := 0; i < spec.maxChildren; i++ {
 			if spec.provider == "alibaba" {
 				urls = append(urls, alibabaBulletinURL(fmt.Sprintf("%d", 1+i)))
+			} else if spec.id == "xai-grok-web-models" {
+				urls = append(urls, fmt.Sprintf("https://x.ai/news/proxy-check-%d", i))
 			} else if spec.provider == "xai" {
 				urls = append(urls, fmt.Sprintf("https://docs.x.ai/developers/migration/proxy-check-%d", i))
 			}
@@ -169,9 +210,10 @@ func validateConfiguredProxy(resolve func(*http.Request) (*url.URL, error)) erro
 }
 
 type parsedPage struct {
-	Title    string
-	Links    []string
-	Evidence []LifecycleEvidence
+	Title             string
+	Links             []string
+	Evidence          []LifecycleEvidence
+	AvailableModelIDs []string
 }
 
 func sourceForProvider(provider string) (sourceSpec, bool) {
@@ -198,11 +240,36 @@ func validateSourceURL(spec sourceSpec, raw string) error {
 		return fetchFailure{code: "source_url_rejected"}
 	}
 	switch spec.id {
+	case "volcengine-ark-account-models":
+		if u.Host != "ark.cn-beijing.volcengineapi.com" || u.Path != "/" || u.RawQuery != "Action=ListModelActivations&Version=2024-01-01" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+	case "alibaba-model-studio-models":
+		if u.Host != "ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com" || u.Path != "/api/v1/models" || u.Fragment != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+		query := u.Query()
+		pageNo, pageSize := query.Get("page_no"), query.Get("page_size")
+		if len(query) != 2 || len(query["page_no"]) != 1 || len(query["page_size"]) != 1 || pageNo == "" || pageSize != "200" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+		pageNumber, err := strconv.Atoi(pageNo)
+		if err != nil || pageNumber < 1 || pageNumber > 100 || strconv.Itoa(pageNumber) != pageNo {
+			return fetchFailure{code: "source_url_rejected"}
+		}
 	case "openai-codex-models":
 		if u.RawQuery != "" || !((u.Host == "developers.openai.com" && u.Path == "/codex/models") || (u.Host == "learn.chatgpt.com" && u.Path == "/docs/models")) {
 			return fetchFailure{code: "source_url_rejected"}
 		}
-	case "openai-codex-changelog":
+	case "openai-chatgpt-models":
+		if u.Host != "help.openai.com" || u.Path != "/en/articles/20001354-gpt-6-and-other-models-in-chatgpt" || u.RawQuery != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+	case "openai-chatgpt-gpt6-announcement":
+		if u.Host != "openai.com" || u.Path != "/index/gpt-6-for-everyone/" || u.RawQuery != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+	case "openai-cross-product-lifecycle-v2":
 		if u.Host != "learn.chatgpt.com" || u.Path != "/docs/changelog" || u.RawQuery != "" {
 			return fetchFailure{code: "source_url_rejected"}
 		}
@@ -210,8 +277,20 @@ func validateSourceURL(spec sourceSpec, raw string) error {
 		if u.Host != "support.claude.com" || u.Path != "/en/articles/12138966-release-notes" || u.RawQuery != "" {
 			return fetchFailure{code: "source_url_rejected"}
 		}
+	case "anthropic-claude-code-models":
+		if u.Host != "support.claude.com" || u.Path != "/en/articles/11940350-claude-code-model-configuration" || u.RawQuery != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+	case "anthropic-claude-web-models":
+		if u.Host != "support.claude.com" || u.Path != "/en/articles/8606394-how-large-is-the-context-window-on-paid-claude-plans" || u.RawQuery != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
 	case "kimi-code-models":
-		if u.Host != "www.kimi.com" || u.Path != "/help/kimi-code/models" || u.RawQuery != "" {
+		if u.Host != "www.kimi.com" || u.Path != "/en/help/kimi-code/models" || u.RawQuery != "" {
+			return fetchFailure{code: "source_url_rejected"}
+		}
+	case "kimi-web-models":
+		if u.Host != "www.kimi.com" || u.Path != "/en/help/new-user-guide/agentic-chat" || u.RawQuery != "" {
 			return fetchFailure{code: "source_url_rejected"}
 		}
 	case "kimi-code-whats-new":
@@ -242,7 +321,11 @@ func validateSourceURL(spec sourceSpec, raw string) error {
 				return fetchFailure{code: "source_url_rejected"}
 			}
 		case "xai":
-			if u.Host != "docs.x.ai" || (u.Path != "/developers/release-notes" && !xaiPath.MatchString(u.Path)) || u.RawQuery != "" {
+			if spec.id == "xai-grok-web-models" {
+				if u.Host != "x.ai" || (u.Path != "/news" && !xaiNewsPath.MatchString(u.Path)) || u.RawQuery != "" {
+					return fetchFailure{code: "source_url_rejected"}
+				}
+			} else if u.Host != "docs.x.ai" || (u.Path != "/developers/release-notes" && !xaiPath.MatchString(u.Path)) || u.RawQuery != "" {
 				return fetchFailure{code: "source_url_rejected"}
 			}
 		default:
@@ -455,7 +538,7 @@ func fetchAndParsePage(ctx context.Context, spec sourceSpec, rawURL string, prio
 		return CachedPage{
 			URL: rawURL, Title: parsed.Title, ContentSHA256: hex.EncodeToString(hash[:]), FetchedAt: now().UTC(),
 			ETag: safeHeader(resp.Header.Get("ETag")), LastModified: safeHeader(resp.Header.Get("Last-Modified")),
-			Links: parsed.Links, Evidence: parsed.Evidence,
+			Links: parsed.Links, Evidence: parsed.Evidence, AvailableModelIDs: parsed.AvailableModelIDs,
 		}, nil
 	}
 	return CachedPage{}, fetchFailure{code: "redirect_limit_exceeded"}
@@ -464,6 +547,24 @@ func fetchAndParsePage(ctx context.Context, spec sourceSpec, rawURL string, prio
 func validateChildren(spec sourceSpec, root string, links []string) ([]string, error) {
 	if spec.maxChildren == 0 {
 		return nil, nil
+	}
+	if spec.id == "xai-grok-web-models" {
+		children := make([]string, 0, len(links))
+		seen := make(map[string]bool, len(links))
+		for _, link := range links {
+			if link == root || seen[link] {
+				continue
+			}
+			if validateSourceURL(spec, link) != nil {
+				return nil, fetchFailure{code: "source_link_rejected"}
+			}
+			seen[link] = true
+			children = append(children, link)
+			if len(children) == spec.maxChildren {
+				break
+			}
+		}
+		return children, nil
 	}
 	rootURL, _ := url.Parse(root)
 	set := make(map[string]bool)
@@ -764,6 +865,9 @@ func openAIDeprecationRows(source string) ([][]string, bool) {
 }
 
 func parseSourcePage(spec sourceSpec, sourceURL string, body []byte, retrievedAt time.Time) (parsedPage, error) {
+	if spec.adapter != "" {
+		return parsedPage{}, errors.New("source requires its authenticated API adapter")
+	}
 	if validateSourceURL(spec, sourceURL) != nil {
 		return parsedPage{}, errors.New("source URL is outside the fixed manifest")
 	}
@@ -776,9 +880,16 @@ func parseSourcePage(spec sourceSpec, sourceURL string, body []byte, retrievedAt
 	if title == "" {
 		return parsedPage{}, errors.New("source title missing")
 	}
-	page := parsedPage{Title: title, Links: extractLinks(sourceURL, string(body))}
+	page := parsedPage{Title: title}
 	if len(linkRE.FindAllString(string(body), MaxParsedLinks+1)) > MaxParsedLinks {
 		return parsedPage{}, errors.New("source has too many links")
+	}
+	if spec.maxChildren > 0 {
+		if spec.id == "xai-grok-web-models" && sourceURL == spec.rootURL {
+			page.Links = extractXAINewsLinks(sourceURL, string(body))
+		} else {
+			page.Links = extractLinks(sourceURL, string(body))
+		}
 	}
 	addEvidence := func(e LifecycleEvidence) {
 		e.SourceID, e.Provider, e.Scope, e.SourceURL, e.SourceTitle, e.RetrievedAt = spec.id, spec.provider, spec.scope, sourceURL, title, retrievedAt
@@ -788,6 +899,13 @@ func parseSourcePage(spec sourceSpec, sourceURL string, body []byte, retrievedAt
 		page.Evidence = append(page.Evidence, e)
 	}
 	if spec.scope != "api" {
+		if spec.catalog {
+			available, err := parseProductAvailableModels(spec, sourceURL, string(body), text)
+			if err != nil {
+				return parsedPage{}, err
+			}
+			page.AvailableModelIDs = available
+		}
 		productEvidence, err := parseProductLifecycle(spec, sourceURL, body, text, retrievedAt)
 		if err != nil {
 			return parsedPage{}, err
@@ -1014,33 +1132,302 @@ func parseProductLifecycle(spec sourceSpec, sourceURL string, body []byte, visib
 		return nil, errors.New("product source title missing")
 	}
 	switch spec.id {
-	case "openai-codex-models", "openai-codex-changelog":
+	case "openai-codex-models":
+		visibleText = productSourceVisibleText(spec, body, visibleText)
 		lowerTitle := strings.ToLower(title)
 		if spec.id == "openai-codex-models" && !strings.Contains(lowerTitle, "model") && !strings.Contains(strings.ToLower(visibleText), "codex") {
 			return nil, errors.New("Codex model page structure changed")
 		}
-		if spec.id == "openai-codex-changelog" && !strings.Contains(strings.ToLower(visibleText), "codex") {
+		if spec.id == "openai-cross-product-lifecycle-v2" && !strings.Contains(strings.ToLower(visibleText), "codex") {
 			return nil, errors.New("Codex changelog structure changed")
 		}
 		return parseExactLifecycleMentions(visibleText, "gpt-", retrievedAt), nil
+	case "openai-cross-product-lifecycle-v2":
+		visibleText = productSourceVisibleText(spec, body, visibleText)
+		if !strings.Contains(strings.ToLower(visibleText), "chatgpt") || !strings.Contains(strings.ToLower(visibleText), "codex") {
+			return nil, errors.New("OpenAI cross-product lifecycle source structure changed")
+		}
+		var evidence []LifecycleEvidence
+		for _, entry := range openAIChangelogEntry.FindAllStringSubmatch(string(body), -1) {
+			if len(entry) != 3 {
+				continue
+			}
+			products := openAIChangelogProducts.FindStringSubmatch(entry[1])
+			if len(products) != 2 || !strings.Contains(strings.ToLower(products[1]), "codex") {
+				continue
+			}
+			heading := openAIChangelogHeading.FindStringSubmatch(entry[2])
+			if len(heading) != 2 {
+				continue
+			}
+			text := extractVisibleText(heading[1])
+			entryText := extractVisibleText(entry[2])
+			if date := openAIChangelogFullDate.FindStringSubmatch(entryText); len(date) == 2 {
+				text = strings.TrimSpace(openAIChangelogShortDate.ReplaceAllString(text, "")) + " effective on " + date[1]
+			}
+			lower := strings.ToLower(text)
+			chatGPTProductExplicit := containsAny(lower, "chatgpt web", "chatgpt work", "chatgpt, chatgpt")
+			if !chatGPTProductExplicit || !strings.Contains(lower, "codex") || !hasLifecycleLanguage(lower) {
+				continue
+			}
+			evidence = append(evidence, parseExactLifecycleMentions(text, "gpt-", retrievedAt)...)
+		}
+		return normalizeEvidence(evidence), nil
+	case "openai-chatgpt-models":
+		visibleText = productSourceVisibleText(spec, body, visibleText)
+		if !strings.Contains(strings.ToLower(visibleText), "other models in chatgpt") || !strings.Contains(strings.ToLower(visibleText), "choose a thinking level") {
+			return nil, errors.New("ChatGPT model guide structure changed")
+		}
+		return nil, nil
+	case "openai-chatgpt-gpt6-announcement":
+		if !containsAny(strings.ToLower(visibleText), "chatgpt", "chat tab") || !strings.Contains(strings.ToLower(visibleText), "gpt") {
+			return nil, errors.New("OpenAI GPT-6 ChatGPT launch page structure changed")
+		}
+		return nil, nil
 	case "anthropic-claude-release-notes":
 		if !strings.Contains(strings.ToLower(title), "release notes") && !strings.Contains(strings.ToLower(visibleText), "claude code") {
 			return nil, errors.New("Claude release-notes page structure changed")
 		}
 		return parseClaudeProductLifecycle(visibleText, retrievedAt), nil
+	case "anthropic-claude-code-models":
+		if !strings.Contains(strings.ToLower(visibleText), "supported models") || !strings.Contains(strings.ToLower(visibleText), "claude code") {
+			return nil, errors.New("Claude Code model configuration page structure changed")
+		}
+		return nil, nil
+	case "anthropic-claude-web-models":
+		if _, ok := extractHTMLHeadingSection(string(body), "Chatting with Claude", "Claude Code"); !ok {
+			return nil, errors.New("Claude consumer model section structure changed")
+		}
+		return nil, nil
 	case "kimi-code-models":
 		if !strings.Contains(strings.ToLower(visibleText), "kimi code") && !strings.Contains(strings.ToLower(title), "kimi") {
 			return nil, errors.New("Kimi Code model page structure changed")
 		}
 		return parseExactLifecycleMentions(visibleText, "kimi-", retrievedAt), nil
+	case "kimi-web-models":
+		if _, ok := extractHTMLHeadingSection(string(body), "Choose a model", "About Kimi K3"); !ok {
+			return nil, errors.New("Kimi web model selector section structure changed")
+		}
+		return nil, nil
 	case "kimi-code-whats-new":
 		if !strings.Contains(strings.ToLower(visibleText), "kimi code") && !strings.Contains(strings.ToLower(title), "kimi") {
 			return nil, errors.New("Kimi Code changelog structure changed")
 		}
 		return parseExactLifecycleMentions(visibleText, "kimi-", retrievedAt), nil
+	case "xai-grok-web-models":
+		return nil, nil
 	default:
 		return nil, errors.New("unknown product lifecycle source")
 	}
+}
+
+func parseProductAvailableModels(spec sourceSpec, sourceURL, body, visibleText string) ([]string, error) {
+	lower := strings.ToLower(visibleText)
+	var section string
+	switch spec.id {
+	case "openai-codex-models":
+		section = productSourceVisibleText(spec, []byte(body), visibleText)
+		if !containsAny(strings.ToLower(section), "codex", "gpt") {
+			return nil, errors.New("Codex model article is missing")
+		}
+		ids := filterModelIDs(modelTokenRE.FindAllString(section, -1), "gpt-")
+		if len(ids) == 0 {
+			return nil, errors.New("Codex current-model list is empty")
+		}
+		return ids, nil
+	case "openai-chatgpt-models":
+		section = productSourceVisibleText(spec, []byte(body), visibleText)
+		lowerSection := strings.ToLower(section)
+		end := strings.Index(lowerSection, "choose a thinking level")
+		if !strings.Contains(lowerSection, "other models in chatgpt") || end < 0 {
+			return nil, errors.New("ChatGPT signed-in model section is missing")
+		}
+		// This article's early section lists ChatGPT model choices. Later sections
+		// separately document Work, Codex, and API availability and must not be
+		// treated as web-selector evidence.
+		section = section[:end]
+		section = strings.NewReplacer("\u2010", "-", "\u2011", "-", "\u2012", "-", "\u2013", "-", "\u2014", "-", "\u2212", "-").Replace(section)
+		ids := filterModelIDs(modelTokenRE.FindAllString(section, -1), "gpt-")
+		if len(ids) == 0 {
+			return nil, errors.New("ChatGPT current-model list is empty")
+		}
+		for i := range ids {
+			ids[i] = strings.ToLower(ids[i])
+		}
+		return uniqueStrings(ids), nil
+	case "openai-chatgpt-gpt6-announcement":
+		lowerText := strings.ToLower(visibleText)
+		if !containsAny(lowerText, "chatgpt", "chat tab") || !strings.Contains(lowerText, "gpt") {
+			return nil, errors.New("OpenAI page does not establish a ChatGPT model launch")
+		}
+		modelText := strings.NewReplacer("\u2010", "-", "\u2011", "-", "\u2012", "-", "\u2013", "-", "\u2014", "-", "\u2212", "-").Replace(visibleText)
+		ids := filterModelIDs(modelTokenRE.FindAllString(modelText, -1), "gpt-")
+		foundGPT6 := false
+		for index := range ids {
+			ids[index] = strings.ToLower(ids[index])
+			if ids[index] == "gpt-6" {
+				foundGPT6 = true
+			}
+		}
+		if !foundGPT6 {
+			return nil, errors.New("OpenAI GPT-6 ChatGPT launch page has no exact GPT-6 family name")
+		}
+		return []string{"gpt-6"}, nil
+	case "anthropic-claude-code-models":
+		start := strings.Index(lower, "supported models")
+		end := strings.Index(lower, "change model for current session only")
+		if start < 0 || end <= start {
+			return nil, errors.New("Claude Code supported-model section is missing")
+		}
+		section = visibleText[start:end]
+		ids := filterModelIDs(modelTokenRE.FindAllString(section, -1), "claude-")
+		if len(ids) == 0 {
+			return nil, errors.New("Claude Code supported-model list is empty")
+		}
+		return ids, nil
+	case "anthropic-claude-web-models":
+		section, ok := extractHTMLHeadingSection(body, "Chatting with Claude", "Claude Code")
+		if !ok || !tableHasHeaders(section, "Model", "Context window") {
+			return nil, errors.New("Claude consumer model table is missing")
+		}
+		ids := make([]string, 0)
+		for _, row := range extractTableRows(section) {
+			if len(row) < 2 || strings.EqualFold(strings.TrimSpace(row[0]), "Model") {
+				continue
+			}
+			if id := claudeConsumerModelAliases[strings.ToLower(strings.TrimSpace(row[0]))]; id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			return nil, errors.New("Claude consumer model names have no reviewed ID aliases")
+		}
+		return uniqueStrings(ids), nil
+	case "kimi-code-models":
+		for _, row := range extractTableRows(body) {
+			if len(row) < 2 || !strings.EqualFold(strings.TrimSpace(row[0]), "Model ID") {
+				continue
+			}
+			ids := make([]string, 0, len(row)-1)
+			for _, cell := range row[1:] {
+				id := strings.TrimSpace(cell)
+				if !validModelID(id) {
+					return nil, errors.New("Kimi Code model table contains an invalid model ID")
+				}
+				ids = append(ids, id)
+			}
+			if len(ids) == 0 {
+				return nil, errors.New("Kimi Code current-model list is empty")
+			}
+			return uniqueStrings(ids), nil
+		}
+		return nil, errors.New("Kimi Code Model ID table is missing")
+	case "kimi-web-models":
+		section, ok := extractHTMLHeadingSection(body, "Choose a model", "About Kimi K3")
+		if !ok || !tableHasHeaders(section, "Model", "Thinking strength", "Best for") {
+			return nil, errors.New("Kimi web model selector table is missing")
+		}
+		ids := make([]string, 0)
+		for _, row := range extractTableRows(section) {
+			if len(row) == 0 || strings.EqualFold(strings.TrimSpace(row[0]), "Model") {
+				continue
+			}
+			if id := kimiWebModelAliases[strings.ToLower(strings.TrimSpace(row[0]))]; id != "" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			return nil, errors.New("Kimi web model names have no reviewed ID aliases")
+		}
+		return uniqueStrings(ids), nil
+	case "xai-grok-web-models":
+		if strings.TrimSpace(extractPageTitle(body)) == "" {
+			return nil, errors.New("xAI news page title is missing")
+		}
+		// The seeded official announcement and its linked articles contribute
+		// only exact IDs or a reviewed display-name alias when the same text line
+		// explicitly says the model is on grok.com.
+		text := extractXAIVisibleText(body)
+		ids := make([]string, 0)
+		for _, line := range textLines(text) {
+			lowerLine := strings.ToLower(line)
+			if !xaiConsumerWebAvailabilityClaim(lowerLine) {
+				continue
+			}
+			ids = append(ids, filterModelIDs(modelTokenRE.FindAllString(line, -1), "grok-")...)
+			for display, id := range xaiGrokWebModelAliases {
+				if strings.Contains(lowerLine, display) {
+					ids = append(ids, id)
+				}
+			}
+		}
+		if sourceURL == spec.rootURL && len(ids) == 0 {
+			return nil, errors.New("seeded xAI Grok web announcement no longer contains a recognized model claim")
+		}
+		return uniqueStrings(ids), nil
+	default:
+		return nil, errors.New("unknown official product model catalog")
+	}
+}
+
+var (
+	claudeConsumerModelAliases = map[string]string{
+		"claude fable 5.1":  "claude-fable-5-1",
+		"claude fable 5":    "claude-fable-5",
+		"claude opus 5.5":   "claude-opus-5-5",
+		"claude opus 5":     "claude-opus-5",
+		"claude opus 4.8":   "claude-opus-4-8",
+		"claude opus 4.7":   "claude-opus-4-7",
+		"claude opus 4.6":   "claude-opus-4-6",
+		"claude sonnet 5.5": "claude-sonnet-5-5",
+		"claude sonnet 5":   "claude-sonnet-5",
+		"claude sonnet 4.6": "claude-sonnet-4-6",
+		"claude haiku 5.5":  "claude-haiku-5-5",
+	}
+	kimiWebModelAliases = map[string]string{
+		"k3": "k3",
+	}
+	xaiGrokWebModelAliases = map[string]string{
+		"grok 4.5": "grok-4.5",
+	}
+)
+
+func xaiConsumerWebAvailabilityClaim(lowerLine string) bool {
+	return strings.Contains(lowerLine, "grok.com") && containsAny(lowerLine,
+		"now on grok.com", "is now on grok.com", "live today on grok.com", "live on grok.com",
+		"available on grok.com", "available to all users on grok.com")
+}
+
+func extractHTMLHeadingSection(source, startHeading, endHeading string) (string, bool) {
+	matches := headingRE.FindAllStringSubmatchIndex(source, -1)
+	start := -1
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+		heading := cleanFragment(source[match[2]:match[3]])
+		if start < 0 {
+			if strings.EqualFold(heading, startHeading) {
+				start = match[1]
+			}
+			continue
+		}
+		if strings.EqualFold(heading, endHeading) {
+			return source[start:match[0]], true
+		}
+	}
+	return "", false
+}
+
+func productSourceVisibleText(spec sourceSpec, body []byte, fallback string) string {
+	if spec.id != "openai-codex-models" && spec.id != "openai-chatgpt-models" {
+		return fallback
+	}
+	match := mainArticleRE.FindSubmatch(body)
+	if len(match) == 2 {
+		return extractVisibleText(string(match[1]))
+	}
+	return fallback
 }
 
 func parseExactLifecycleMentions(text, prefix string, retrievedAt time.Time) []LifecycleEvidence {
@@ -1337,6 +1724,10 @@ func lifecycleStatusInContext(lower string, retrievedAt time.Time) (string, stri
 	}
 	futureRetirementRe := regexp.MustCompile(`\b(?:will|scheduled to|planned to|expected to|set to)\b.{0,60}\b(?:retire|retires|retired|be\s+retired|be\s+removed|be\s+discontinued|end of life)\b`)
 	futureRetirementMatch := futureRetirementRe.FindStringIndex(lower)
+	futureDeprecationMatch := regexp.MustCompile(`\b(?:will|scheduled to|planned to|expected to|set to)\b.{0,60}\b(?:deprecate|deprecated)\b`).FindStringIndex(lower)
+	if futureDeprecationMatch != nil && futureRetirementMatch == nil {
+		return "announced_deprecated", lifecycleEffectiveDate(lower, futureDeprecationMatch[1])
+	}
 	retirementActionEnd := -1
 	if futureRetirementMatch != nil {
 		retirementActionEnd = futureRetirementMatch[1]
@@ -1380,6 +1771,9 @@ func lifecycleStatusInContext(lower string, retrievedAt time.Time) (string, stri
 	if hardRetired {
 		return "retired", effective
 	}
+	if strings.Contains(lower, "deprecated") {
+		return "deprecated", effective
+	}
 	return "announced_deprecated", effective
 }
 
@@ -1392,10 +1786,25 @@ func extractVisibleText(source string) string {
 }
 
 func extractXAIVisibleText(source string) string {
+	metaText := make([]string, 0, 2)
+	for _, tag := range metaTagRE.FindAllString(source, -1) {
+		nameMatch := metaNameRE.FindStringSubmatch(tag)
+		if len(nameMatch) != 2 {
+			continue
+		}
+		name := strings.ToLower(nameMatch[1])
+		if name != "description" && name != "og:description" {
+			continue
+		}
+		if match := metaContentRE.FindStringSubmatch(tag); len(match) == 2 {
+			metaText = append(metaText, html.UnescapeString(match[1]))
+		}
+	}
 	source = scriptRE.ReplaceAllString(source, " ")
 	source = regexp.MustCompile(`(?i)</(title|h[1-6]|p|tr|td|th|li|section|article|br|div|summary)>`).ReplaceAllString(source, "\n")
 	source = tagRE.ReplaceAllString(source, " ")
 	lines := strings.Split(html.UnescapeString(source), "\n")
+	lines = append(lines, metaText...)
 	for i := range lines {
 		lines[i] = strings.TrimSpace(spaceRE.ReplaceAllString(lines[i], " "))
 	}
@@ -1499,6 +1908,38 @@ func extractLinks(base, source string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// extractXAINewsLinks keeps the archive's DOM order so the bounded crawl sees
+// the newest announcements first. Only same-site, single-segment news posts
+// can become child fetches.
+func extractXAINewsLinks(base, source string) []string {
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	links := make([]string, 0)
+	for _, match := range linkRE.FindAllStringSubmatch(source, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		href := html.UnescapeString(strings.TrimSpace(match[1]))
+		parsed, err := url.Parse(href)
+		if err != nil {
+			continue
+		}
+		resolved := baseURL.ResolveReference(parsed)
+		if resolved.Scheme != "https" || resolved.Host != "x.ai" || resolved.User != nil || resolved.Port() != "" || resolved.RawQuery != "" || resolved.ForceQuery || resolved.Fragment != "" || !xaiNewsPath.MatchString(resolved.Path) {
+			continue
+		}
+		value := resolved.String()
+		if !seen[value] {
+			seen[value] = true
+			links = append(links, value)
+		}
+	}
+	return links
 }
 
 func cleanFragment(s string) string {
@@ -1664,7 +2105,7 @@ func normalizeEvidence(evidence []LifecycleEvidence) []LifecycleEvidence {
 
 func validLifecycleStatus(status string) bool {
 	switch status {
-	case "announced_deprecated", "retired", "retired_with_compatibility_route", "legacy":
+	case "announced_deprecated", "deprecated", "retired", "retired_with_compatibility_route", "legacy":
 		return true
 	default:
 		return false
@@ -1792,7 +2233,13 @@ func snapshotDigest(pages []CachedPage) (string, error) {
 		if page.URL == "" || page.ContentSHA256 == "" || page.Title == "" || page.FetchedAt.IsZero() {
 			return "", errors.New("invalid page snapshot")
 		}
-		parts = append(parts, page.URL+"\x00"+page.ContentSHA256)
+		available := append([]string{}, page.AvailableModelIDs...)
+		sort.Strings(available)
+		pagination := ""
+		if page.CatalogTotal != 0 || page.CatalogPageNo != 0 || page.CatalogPageSize != 0 {
+			pagination = fmt.Sprintf("\x00%d\x00%d\x00%d", page.CatalogTotal, page.CatalogPageNo, page.CatalogPageSize)
+		}
+		parts = append(parts, page.URL+"\x00"+page.ContentSHA256+"\x00"+strings.Join(available, "\x00")+pagination)
 	}
 	sort.Strings(parts)
 	hash := sha256.Sum256([]byte(strings.Join(parts, "\n")))

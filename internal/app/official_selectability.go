@@ -46,6 +46,17 @@ func loadRulesWithOfficialSnapshot(cfg config.Config, now time.Time) (catalog.Ru
 	return rules, rulesHash, fileHash, nil
 }
 
+// loadRulesForRun selects the evidence boundary for a screening run. The
+// full-screen 404token workflow treats its freshly synchronized upstream list
+// as the availability source and never loads or fetches provider snapshots.
+func loadRulesForRun(cfg config.Config, fullScreen bool, now time.Time) (catalog.Rules, string, string, error) {
+	if fullScreen {
+		rules, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
+		return rules, rulesHash, "", err
+	}
+	return loadRulesWithOfficialSnapshot(cfg, now)
+}
+
 func acquireOfficialSelectabilityLock(cfg config.Config) (*state.Lock, error) {
 	if len(cfg.OfficialSelectabilitySources) == 0 {
 		return nil, nil

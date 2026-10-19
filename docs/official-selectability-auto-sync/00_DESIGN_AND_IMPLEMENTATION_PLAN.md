@@ -1,5 +1,13 @@
 # Official Selectability Auto-Sync and One-Click Screening
 
+> **Historical design; superseded for current screening.** This document
+> describes the earlier API-key catalog and manual account-selector approach.
+> Current full-screen eligibility uses exact evidence from accepted official
+> web/login products under
+> [`../official-product-availability.md`](../official-product-availability.md).
+> The 404token directory is only the candidate/routing-feasibility input; it
+> cannot establish official product availability.
+
 ## Goal and baseline
 
 Make the existing full-screen command refresh official model-access evidence,

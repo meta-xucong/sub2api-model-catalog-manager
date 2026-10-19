@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -44,6 +45,15 @@ func specForID(t *testing.T, sourceID string) sourceSpec {
 		t.Fatalf("source missing: %s", sourceID)
 	}
 	return spec
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestOfficialLifecycleParsersUseAPIProductSources(t *testing.T) {
@@ -148,8 +158,8 @@ func TestProductLifecycleSourcesUseExactClientScopeEvidence(t *testing.T) {
 		fixture  string
 		want     map[string]string
 	}{
-		{"openai-codex-models", "openai-codex-models.html", map[string]string{"gpt-5.3-codex-spark": "retired", "gpt-5.4": "retired", "gpt-5.4-mini": "retired", "gpt-5.2": "announced_deprecated", "gpt-5.3-codex": "announced_deprecated"}},
-		{"openai-codex-changelog", "openai-codex-changelog.html", map[string]string{"gpt-5.5": "retired"}},
+		{"openai-codex-models", "openai-codex-models.html", map[string]string{"GPT-5.5": "retired", "gpt-5.3-codex-spark": "retired", "gpt-5.4": "retired", "gpt-5.4-mini": "retired", "gpt-5.2": "deprecated", "gpt-5.3-codex": "deprecated"}},
+		{"openai-cross-product-lifecycle-v2", "openai-cross-product-lifecycle.html", map[string]string{"GPT-5.5": "retired"}},
 		{"anthropic-claude-release-notes", "anthropic-claude-release-notes.html", map[string]string{"claude-opus-4-20250514": "retired", "claude-opus-4-1-20250805": "retired"}},
 		{"kimi-code-models", "kimi-code-models.html", map[string]string{}},
 		{"kimi-code-whats-new", "kimi-code-whats-new.html", map[string]string{}},
@@ -175,6 +185,26 @@ func TestProductLifecycleSourcesUseExactClientScopeEvidence(t *testing.T) {
 				if got[id] != want {
 					t.Errorf("%s status=%q want %q", id, got[id], want)
 				}
+			}
+		})
+	}
+}
+
+func TestOpenAIUnionRetirementRequiresExplicitChatGPTProductSurface(t *testing.T) {
+	spec := specForID(t, "openai-cross-product-lifecycle-v2")
+	cases := []string{
+		"gpt-5.5 retires from ChatGPT and Codex on October 14, 2026.",
+		"gpt-5.4 retires from Codex with ChatGPT sign-in on August 31, 2026.",
+	}
+	for _, notice := range cases {
+		t.Run(notice, func(t *testing.T) {
+			body := []byte("<!doctype html><html><head><title>ChatGPT &amp; Codex Changelog</title></head><body><h1>ChatGPT and Codex Changelog</h1><ul><li data-product=\"codex\" data-products=\"codex\"><h3>Notice</h3><p>" + notice + "</p></li></ul></body></html>")
+			parsed, err := parseSourcePage(spec, spec.rootURL, body, time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(parsed.Evidence) != 0 {
+				t.Fatalf("non-specific ChatGPT wording must not establish accepted-union retirement: %+v", parsed.Evidence)
 			}
 		})
 	}
@@ -229,7 +259,7 @@ func TestLifecycleStatusDoesNotTreatDeprecatedDatesOrFutureWordingAsRetired(t *t
 	}{
 		{text: "gpt-test will be retired", want: "announced_deprecated"},
 		{text: "gpt-test is scheduled to be retired", want: "announced_deprecated"},
-		{text: "gpt-test was deprecated on September 14, 2026", want: "announced_deprecated"},
+		{text: "gpt-test was deprecated on September 14, 2026", want: "deprecated"},
 		{text: "gpt-test will be retired on September 14, 2026", want: "retired", wantEffectiveAt: "2026-09-14"},
 		{text: "gpt-test will be retired on December 13, 2026", want: "announced_deprecated", wantEffectiveAt: "2026-12-13"},
 		{text: "gpt-test is no longer available", want: "retired"},
@@ -246,6 +276,9 @@ func TestLifecycleStatusDoesNotTreatDeprecatedDatesOrFutureWordingAsRetired(t *t
 		}
 	}
 
+	if !exclusionEligible(LifecycleEvidence{Status: "deprecated"}, now) {
+		t.Fatal("an official model already marked deprecated was not eligible for removal")
+	}
 	if exclusionEligible(LifecycleEvidence{Status: "announced_deprecated", EffectiveAt: "2026-09-14"}, now) {
 		t.Fatal("an old deprecation date without a retirement status must not auto-exclude")
 	}
@@ -298,6 +331,9 @@ func TestFixedSourceFixturesBuildValidSnapshots(t *testing.T) {
 	doer := fixtureRouter(t, false)
 	for _, spec := range sourceManifest {
 		t.Run(spec.id, func(t *testing.T) {
+			if spec.adapter != "" {
+				t.Skip("authenticated API adapter has dedicated request tests")
+			}
 			snapshot, err := fetchSource(context.Background(), spec, nil, doer, &requestBudget{}, func() time.Time { return when })
 			if err != nil {
 				t.Fatal(err)
@@ -309,7 +345,200 @@ func TestFixedSourceFixturesBuildValidSnapshots(t *testing.T) {
 				}
 				t.Fatalf("fixture snapshot invalid: %v; pages=%+v aggregate=%+v", err, normalizeEvidence(pageEvidence), normalizeEvidence(snapshot.Evidence))
 			}
+			available := make([]string, 0)
+			for _, page := range snapshot.Pages {
+				available = append(available, page.AvailableModelIDs...)
+			}
+			if spec.catalog && !spec.catalogMayBeEmpty && len(available) == 0 {
+				t.Fatalf("official current model list was not parsed for %s", spec.id)
+			}
+			if spec.id == "kimi-code-models" {
+				got := snapshot.Pages[0].AvailableModelIDs
+				want := []string{"k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("Kimi official model table mismatch: got=%v want=%v", got, want)
+				}
+			}
+			if spec.id == "openai-cross-product-lifecycle-v2" && len(snapshot.Pages[0].Links) != 0 {
+				t.Fatalf("non-recursive Codex changelog should not persist unused links: %d", len(snapshot.Pages[0].Links))
+			}
+			if spec.id == "xai-grok-web-models" {
+				if !containsString(available, "grok-4.5") || containsString(available, "grok-4.7") {
+					t.Fatalf("Grok news catalog accepted wrong-surface or missed web models: %v", available)
+				}
+			}
 		})
+	}
+}
+
+func TestOfficialWebProductCatalogParsersAndReviewedAliases(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		sourceID string
+		fixture  string
+		want     []string
+		absent   []string
+	}{
+		{"openai-chatgpt-models", "openai-chatgpt-models.html", []string{"gpt-5.6", "gpt-6"}, []string{"gpt-6.1", "gpt-9-api-only"}},
+		{"openai-chatgpt-gpt6-announcement", "openai-gpt6-for-everyone.html", []string{"gpt-6"}, []string{"gpt-6.1", "gpt-9-api-only"}},
+		{"anthropic-claude-web-models", "anthropic-claude-web-models.html", []string{
+			"claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+			"claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-5-5",
+		}, []string{"claude-haiku-4-5-20251001"}},
+		{"kimi-web-models", "kimi-web-models.html", []string{"k3"}, []string{"k2.6", "k3-256k"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sourceID, func(t *testing.T) {
+			spec := specForID(t, tc.sourceID)
+			parsed, err := parseSourcePage(spec, spec.rootURL, fixture(t, tc.fixture), now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range tc.want {
+				if !containsString(parsed.AvailableModelIDs, want) {
+					t.Errorf("available IDs %v miss %q", parsed.AvailableModelIDs, want)
+				}
+			}
+			for _, absent := range tc.absent {
+				if containsString(parsed.AvailableModelIDs, absent) {
+					t.Errorf("unlisted or unsupported display alias %q was admitted: %v", absent, parsed.AvailableModelIDs)
+				}
+			}
+		})
+	}
+	for _, pair := range []struct {
+		webSourceID, webFixture   string
+		codeSourceID, codeFixture string
+	}{
+		{"anthropic-claude-web-models", "anthropic-claude-web-models.html", "anthropic-claude-code-models", "anthropic-claude-code-models.html"},
+		{"kimi-web-models", "kimi-web-models.html", "kimi-code-models", "kimi-code-models.html"},
+	} {
+		webSpec, codeSpec := specForID(t, pair.webSourceID), specForID(t, pair.codeSourceID)
+		webCatalog, err := parseSourcePage(webSpec, webSpec.rootURL, fixture(t, pair.webFixture), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		codeCatalog, err := parseSourcePage(codeSpec, codeSpec.rootURL, fixture(t, pair.codeFixture), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range webCatalog.AvailableModelIDs {
+			if !containsString(codeCatalog.AvailableModelIDs, id) {
+				t.Errorf("reviewed web alias %q has no exact ID in the official companion Code model list", id)
+			}
+		}
+	}
+	// Cross-check each reviewed Claude consumer display-name alias against the
+	// exact display-name/ID pair on the official Claude Code model list. A set
+	// membership check alone would allow two valid IDs to be accidentally swapped.
+	claudeWeb, ok := extractHTMLHeadingSection(string(fixture(t, "anthropic-claude-web-models.html")), "Chatting with Claude", "Claude Code")
+	if !ok {
+		t.Fatal("Claude consumer model section is missing")
+	}
+	claudeCode, ok := extractHTMLHeadingSection(string(fixture(t, "anthropic-claude-code-models.html")), "Supported models", "Change model for current session only")
+	if !ok {
+		t.Fatal("Claude Code supported-model section is missing")
+	}
+	codeTagRE := regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
+	claudeCodePairs := make(map[string]string)
+	for _, item := range listItemRE.FindAllString(claudeCode, -1) {
+		match := codeTagRE.FindStringSubmatch(item)
+		if len(match) != 2 {
+			continue
+		}
+		id := strings.ToLower(cleanFragment(match[1]))
+		label := strings.ToLower(strings.TrimSuffix(cleanFragment(codeTagRE.ReplaceAllString(item, "")), ","))
+		claudeCodePairs[label] = id
+	}
+	for _, row := range extractTableRows(claudeWeb) {
+		if len(row) == 0 || strings.EqualFold(strings.TrimSpace(row[0]), "Model") {
+			continue
+		}
+		displayName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(row[0]), "Claude ")))
+		wantID := claudeConsumerModelAliases[strings.ToLower(strings.TrimSpace(row[0]))]
+		if wantID == "" {
+			continue
+		}
+		if gotID := claudeCodePairs[displayName]; gotID != wantID {
+			t.Errorf("Claude display alias %q maps to %q; official Code list pairs it with %q", row[0], wantID, gotID)
+		}
+	}
+
+	// Preserve the already supported Codex, Claude Code, and Kimi Code sources.
+	for _, tc := range []struct {
+		sourceID string
+		fixture  string
+		want     string
+	}{
+		{"openai-codex-models", "openai-codex-models.html", "gpt-6-astra"},
+		{"anthropic-claude-code-models", "anthropic-claude-code-models.html", "claude-sonnet-5-5"},
+		{"kimi-code-models", "kimi-code-models.html", "k3-256k"},
+	} {
+		spec := specForID(t, tc.sourceID)
+		parsed, err := parseSourcePage(spec, spec.rootURL, fixture(t, tc.fixture), now)
+		if err != nil || !containsString(parsed.AvailableModelIDs, tc.want) {
+			t.Fatalf("existing source %s failed: IDs=%v err=%v", tc.sourceID, parsed.AvailableModelIDs, err)
+		}
+	}
+}
+
+func TestOfficialWebProductCatalogParsersRejectStructureDrift(t *testing.T) {
+	cases := []struct {
+		sourceID string
+		fixture  string
+		needle   string
+	}{
+		{"openai-chatgpt-models", "openai-chatgpt-models.html", "Choose a thinking level"},
+		{"anthropic-claude-web-models", "anthropic-claude-web-models.html", "Chatting with Claude"},
+		{"kimi-web-models", "kimi-web-models.html", "Choose a model"},
+		{"xai-grok-web-models", "xai-grok-4-5-everywhere.html", "now on grok.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sourceID, func(t *testing.T) {
+			spec := specForID(t, tc.sourceID)
+			body := string(fixture(t, tc.fixture))
+			mutated := strings.ReplaceAll(body, tc.needle, "unexpected heading")
+			if mutated == body {
+				t.Fatal("fixture mutation did not apply")
+			}
+			if _, err := parseSourcePage(spec, spec.rootURL, []byte(mutated), time.Now()); err == nil {
+				t.Fatal("catalog page with missing structure anchor was accepted")
+			}
+		})
+	}
+}
+
+func TestGrokWebCatalogRequiresExplicitConsumerSurfaceAndReviewedAlias(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	spec := specForID(t, "xai-grok-web-models")
+	valid, err := parseSourcePage(spec, spec.rootURL, fixture(t, "xai-grok-4-5-everywhere.html"), now)
+	if err != nil || !reflect.DeepEqual(valid.AvailableModelIDs, []string{"grok-4.5"}) {
+		t.Fatalf("reviewed Grok 4.5 web alias mismatch: IDs=%v err=%v", valid.AvailableModelIDs, err)
+	}
+	wrongSurface, err := parseSourcePage(spec, "https://x.ai/news/grok-4-7", fixture(t, "xai-grok-4-7-wrong-surface.html"), now)
+	if err != nil || len(wrongSurface.AvailableModelIDs) != 0 {
+		t.Fatalf("Grok 4.7 API/Build announcement was admitted as web availability: IDs=%v err=%v", wrongSurface.AvailableModelIDs, err)
+	}
+}
+
+func TestGrokWebCatalogPositiveEvidenceFlowsThroughProductAvailability(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	spec := specForID(t, "xai-grok-web-models")
+	snapshot, err := fetchSource(context.Background(), spec, nil, fixtureRouter(t, false), &requestBudget{}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := StartupSyncResult{Providers: []ProviderSync{{SourceID: spec.id, Provider: spec.provider, Scope: spec.scope, Status: "updated", Snapshot: &snapshot}}}
+	availability := EvaluateProductAvailability(result, []string{"grok-4.5", "grok-4.7"}, now)
+	byID := map[string]ProductModelAvailability{}
+	for _, item := range availability {
+		byID[item.ModelID] = item
+	}
+	if byID["grok-4.5"].Status != "available" || byID["grok-4.5"].MatchKind != "exact" {
+		t.Fatalf("official Grok web evidence did not flow to positive eligibility: %+v", byID["grok-4.5"])
+	}
+	if byID["grok-4.7"].Status != "insufficient_evidence" {
+		t.Fatalf("wrong-surface Grok 4.7 should remain unknown: %+v", byID["grok-4.7"])
 	}
 }
 
@@ -319,8 +548,102 @@ func TestLifecycleScopeFreshnessAndNearRetirementBoundaries(t *testing.T) {
 	if !LifecycleScopeReady(base, "openai_codex_chatgpt_login", now) {
 		t.Fatal("fresh complete Codex source set should be ready")
 	}
-	if got := AutomaticExclusions(base, []string{"openai_codex_chatgpt_login"}, now); len(got) == 0 {
-		t.Fatal("explicit retired Codex model evidence was not selected")
+	current, ok := CurrentModelCatalog(base, "openai_codex_chatgpt_login", now)
+	currentIDs := map[string]bool{}
+	for _, modelID := range current.ModelIDs {
+		currentIDs[modelID] = true
+	}
+	if !ok || !currentIDs["gpt-6.1-sol"] || !currentIDs["gpt-6-sol"] || !currentIDs["GPT-5.6"] || currentIDs["gpt-5.2"] {
+		t.Fatalf("official exact current model list was not extracted: %+v, ready=%t", current, ok)
+	}
+	if currentIDs["gpt-5.5"] || currentIDs["gpt-5.4"] || currentIDs["gpt-5.4-mini"] {
+		t.Fatalf("retired IDs leaked back into the current catalog because of case differences: %+v", current.ModelIDs)
+	}
+	if !CurrentCatalogIncludes("openai_codex_chatgpt_login", "gpt-5.6-terra", current.ModelIDs) || CurrentCatalogIncludes("openai_codex_chatgpt_login", "gpt-5.6-terra-openai-compact", current.ModelIDs) {
+		t.Fatalf("only explicit GPT-5.6 aliases should survive: %+v", current.ModelIDs)
+	}
+	if !CurrentCatalogIncludes("openai_codex_chatgpt_login", "gpt-6-sol", current.ModelIDs) || CurrentCatalogIncludes("openai_codex_chatgpt_login", "gpt-image-2", current.ModelIDs) {
+		t.Fatalf("Codex article extraction should keep listed GPT-6 Sol and exclude unrelated image IDs: %+v", current.ModelIDs)
+	}
+	got := AutomaticExclusions(base, []string{"openai_codex_chatgpt_login"}, now)
+	if len(got) != 1 || !strings.EqualFold(got[0].ModelID, "gpt-5.5") || got[0].Status != "retired" {
+		t.Fatalf("only the exact cross-product GPT-5.5 retirement should remove a model from the accepted union: %+v", got)
+	}
+	codexRetirements := productSurfaceRetirements(base, "openai_codex", now)
+	if !containsLifecycleModel(codexRetirements, "gpt-5.5") {
+		t.Fatalf("accepted-union retirement must suppress contradictory positive Codex evidence: %+v", codexRetirements)
+	}
+	if leaked := productSurfaceRetirements(base, "anthropic_claude_consumer", now); containsLifecycleModel(leaked, "gpt-5.5") {
+		t.Fatalf("OpenAI accepted-union evidence leaked into the Anthropic product surface: %+v", leaked)
+	}
+	availability := EvaluateProductAvailability(base, []string{
+		"gpt-6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-4o-audio-preview",
+		"gpt-4o-realtime-preview", "gpt-5.6-terra-openai-compact", "deepseek-flash", "qwen3.8-flash",
+	}, now)
+	byID := make(map[string]ProductModelAvailability, len(availability))
+	for _, item := range availability {
+		byID[strings.ToLower(item.ModelID)] = item
+	}
+	for _, id := range []string{"gpt-6-sol", "gpt-5.6-terra"} {
+		if byID[id].Status != "available" {
+			t.Errorf("exact product evidence should keep %s available: %+v", id, byID[id])
+		}
+	}
+	if byID["gpt-5.5"].Status != "unavailable" || byID["gpt-5.5"].MatchKind != "accepted_union_retirement" {
+		t.Errorf("explicit cross-product retirement should remove gpt-5.5 from the accepted union: %+v", byID["gpt-5.5"])
+	}
+	// Prove the new accepted-union source alone suppresses a conflicting Codex
+	// positive. The same-surface Codex retirement must not mask a broken union path.
+	unionOnly := base
+	unionOnly.Providers = append([]ProviderSync(nil), base.Providers...)
+	for i := range unionOnly.Providers {
+		provider := &unionOnly.Providers[i]
+		if provider.SourceID != "openai-codex-models" || provider.Snapshot == nil {
+			continue
+		}
+		snapshot := *provider.Snapshot
+		snapshot.Pages = append([]CachedPage(nil), snapshot.Pages...)
+		snapshot.Evidence = append([]LifecycleEvidence(nil), snapshot.Evidence...)
+		filtered := snapshot.Evidence[:0]
+		for _, evidence := range snapshot.Evidence {
+			if !strings.EqualFold(evidence.ModelID, "gpt-5.5") {
+				filtered = append(filtered, evidence)
+			}
+		}
+		snapshot.Evidence = filtered
+		for pageIndex := range snapshot.Pages {
+			page := snapshot.Pages[pageIndex]
+			page.Evidence = append([]LifecycleEvidence(nil), page.Evidence...)
+			pageFiltered := page.Evidence[:0]
+			for _, evidence := range page.Evidence {
+				if !strings.EqualFold(evidence.ModelID, "gpt-5.5") {
+					pageFiltered = append(pageFiltered, evidence)
+				}
+			}
+			page.Evidence = pageFiltered
+			snapshot.Pages[pageIndex] = page
+		}
+		var err error
+		snapshot.ContentSHA256, err = snapshotDigest(snapshot.Pages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		provider.Snapshot = &snapshot
+	}
+	unionOnlyAvailability := EvaluateProductAvailability(unionOnly, []string{"gpt-5.5"}, now)
+	if len(unionOnlyAvailability) != 1 || unionOnlyAvailability[0].Status != "unavailable" || unionOnlyAvailability[0].MatchKind != "accepted_union_retirement" {
+		t.Fatalf("cross-product lifecycle evidence alone must suppress a conflicting Codex positive: %+v", unionOnlyAvailability)
+	}
+	for _, id := range []string{"gpt-4o-audio-preview", "gpt-4o-realtime-preview", "gpt-5.6-terra-openai-compact", "deepseek-flash", "qwen3.8-flash"} {
+		if byID[id].Status != "insufficient_evidence" {
+			t.Errorf("product-specific retirement, omission, alias suffix, or another vendor must remain insufficient for %s: %+v", id, byID[id])
+		}
+	}
+	if byID["qwen3.8-flash"].Provider != "alibaba" {
+		t.Errorf("Qwen versioned namespace was not recognized independently of relay platform: %+v", byID["qwen3.8-flash"])
+	}
+	if byID["gpt-5.6-terra"].MatchKind != "explicit_alias" {
+		t.Errorf("GPT-5.6 product alias should be visibly marked explicit: %+v", byID["gpt-5.6-terra"])
 	}
 
 	exactSevenDays := makeProductScopeResult(t, "openai_codex_chatgpt_login", now.Add(-MaxLifecycleCacheAge), false, false)
@@ -342,22 +665,231 @@ func TestLifecycleScopeFreshnessAndNearRetirementBoundaries(t *testing.T) {
 
 	near60 := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, true)
 	selected := AutomaticExclusions(near60, []string{"openai_codex_chatgpt_login"}, now)
-	seen60, seen61 := false, false
+	selectedIDs := map[string]bool{}
 	for _, item := range selected {
-		seen60 = seen60 || item.ModelID == "gpt-near-sixty-test"
-		seen61 = seen61 || item.ModelID == "gpt-near-sixty-one-test"
+		selectedIDs[strings.ToLower(item.ModelID)] = true
 	}
-	if !seen60 || seen61 {
-		t.Fatalf("60-day boundary mismatch: included60=%t included61=%t", seen60, seen61)
+	for _, id := range []string{"gpt-5.5", "gpt-near-sixty-test", "gpt-retired-today-test", "gpt-retired-past-test"} {
+		if !selectedIDs[id] {
+			t.Errorf("explicit accepted-union lifecycle event %q was not selected: %+v", id, selected)
+		}
 	}
-	seenToday, seenPast := false, false
-	for _, item := range selected {
-		seenToday = seenToday || item.ModelID == "gpt-retired-today-test"
-		seenPast = seenPast || item.ModelID == "gpt-retired-past-test"
+	if selectedIDs["gpt-near-sixty-one-test"] {
+		t.Fatalf("retirement outside the 60-day horizon was selected: %+v", selected)
 	}
-	if !seenToday || !seenPast {
-		t.Fatalf("same-day or past retirement was not automatically selected: today=%t past=%t", seenToday, seenPast)
+}
+
+func TestFailedCurrentFetchCannotUseLastGoodSnapshotForProductDecisions(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	for _, staleStatus := range []string{"stale", "offline_cached"} {
+		t.Run(staleStatus, func(t *testing.T) {
+			result := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, false)
+			for index := range result.Providers {
+				result.Providers[index].Status = staleStatus
+				result.Providers[index].ErrorCode = "current_fetch_failed"
+			}
+
+			if LifecycleScopeReady(result, "openai_codex_chatgpt_login", now) {
+				t.Fatal("last-good snapshots incorrectly made the product scope actionable")
+			}
+			if exclusions := AutomaticExclusions(result, []string{"openai_codex_chatgpt_login"}, now); len(exclusions) != 0 {
+				t.Fatalf("stale lifecycle evidence authorized exclusions: %+v", exclusions)
+			}
+			if _, ok := CurrentModelCatalog(result, "openai_codex_chatgpt_login", now); ok {
+				t.Fatal("last-good product page was exposed as a current catalog")
+			}
+			availability := EvaluateProductAvailability(result, []string{"gpt-5.6", "gpt-5.5", "gpt-5.4"}, now)
+			for _, item := range availability {
+				if item.Status != "insufficient_evidence" {
+					t.Errorf("cached page authorized a %s decision for %s: %+v", item.Status, item.ModelID, item)
+				}
+			}
+		})
 	}
+}
+
+func containsLifecycleModel(evidence []LifecycleEvidence, modelID string) bool {
+	for _, item := range evidence {
+		if strings.EqualFold(item.ModelID, modelID) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCurrentCatalogIncludesOpenAIVersionFamiliesButNotOtherProductIDs(t *testing.T) {
+	catalog := []string{"gpt-5.6", "gpt-6", "gpt-6.1", "gpt-6-astra", "gpt-6-luna"}
+	tests := []struct {
+		id      string
+		want    bool
+		compare bool
+	}{
+		{id: "gpt-5.6-sol", want: true, compare: true},
+		{id: "gpt-5.6-terra", want: true, compare: true},
+		{id: "gpt-5.6-terra-openai-compact", want: false, compare: false},
+		{id: "gpt-5.5-openai-compact", want: false, compare: false},
+		{id: "gpt-5.4-mini", want: false, compare: false},
+		{id: "gpt-7.0-preview", want: false, compare: false},
+		{id: "gpt-4o-audio-preview", want: false, compare: false},
+		{id: "gpt-image-2.5-flare", want: false, compare: false},
+		{id: "gpt-5.5-fast", want: false, compare: false},
+		{id: "deepseek-flash", want: false, compare: false},
+	}
+	for _, test := range tests {
+		t.Run(test.id, func(t *testing.T) {
+			if got := CurrentCatalogIncludes("openai_codex_chatgpt_login", test.id, catalog); got != test.want {
+				t.Errorf("CurrentCatalogIncludes(%q)=%t want %t", test.id, got, test.want)
+			}
+			if got := HasComparableModelFamily("openai_codex_chatgpt_login", test.id, catalog); got != test.compare {
+				t.Errorf("HasComparableModelFamily(%q)=%t want %t", test.id, got, test.compare)
+			}
+		})
+	}
+	if CurrentCatalogIncludes("kimi_code_login", "k3-256k", []string{"k3", "k3-256k"}) != true {
+		t.Fatal("non-OpenAI catalog should retain exact official IDs")
+	}
+}
+
+func TestAPILifecycleCatalogNeverEstablishesProductAvailability(t *testing.T) {
+	got := EvaluateProductAvailability(StartupSyncResult{Providers: []ProviderSync{{
+		SourceID: "openai-api-deprecations", Provider: "openai", Scope: "api", Status: "updated",
+	}}}, []string{"gpt-6-sol", "gpt-5.5"}, time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC))
+	for _, item := range got {
+		if item.Status != "insufficient_evidence" || item.MatchKind != "none" {
+			t.Fatalf("API lifecycle source must not qualify login-product model %s: %+v", item.ModelID, item)
+		}
+	}
+}
+
+func TestConsumerRetirementDoesNotCancelClaudeCodePositiveEvidence(t *testing.T) {
+	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	startup := makeProductScopeResult(t, "anthropic_claude_code_login", now, false, false)
+	addTestProductLifecycleEvidence(t, &startup, "anthropic-claude-release-notes", "claude-sonnet-5-5", "announced_deprecated", "2026-10-29", now)
+	retirements := productSurfaceRetirements(startup, "anthropic_claude_consumer", now)
+	foundRetirement := false
+	for _, item := range retirements {
+		foundRetirement = foundRetirement || item.ModelID == "claude-sonnet-5-5"
+	}
+	if !foundRetirement {
+		t.Fatalf("consumer retirement fixture was not captured: %+v", retirements)
+	}
+	if codeRetirements := productSurfaceRetirements(startup, "anthropic_claude_code", now); len(codeRetirements) != 0 {
+		t.Fatalf("consumer retirement leaked into Claude Code surface: %+v", codeRetirements)
+	}
+	availability := EvaluateProductAvailability(startup, []string{"claude-sonnet-5-5"}, now)
+	if len(availability) != 1 || availability[0].Status != "available" || availability[0].MatchKind != "exact" {
+		t.Fatalf("future consumer retirement must not cancel the current exact Claude Code model listing: %+v", availability)
+	}
+}
+
+func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
+	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	startup := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, false)
+	ids := EvaluateProductAvailability(startup, []string{"gpt-4o-audio-preview", "gpt-5.4", "gpt-5.5"}, now)
+	byID := map[string]ProductModelAvailability{}
+	for _, item := range ids {
+		byID[item.ModelID] = item
+	}
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_version_floor" || byID["gpt-5.5"].Status != "unavailable" {
+		t.Fatalf("older GPT versions should fall below the official floor while exact cross-product retirement remains attributed separately: %+v", ids)
+	}
+	if byID["gpt-4o-audio-preview"].Status != "insufficient_evidence" {
+		t.Fatalf("specialized product IDs must remain unknown without complete union evidence: %+v", byID["gpt-4o-audio-preview"])
+	}
+
+	original := append([]sourceSpec(nil), sourceManifest...)
+	defer func() { sourceManifest = original }()
+	for i := range sourceManifest {
+		if sourceManifest[i].scope == "openai_codex_chatgpt_login" && sourceManifest[i].catalog {
+			sourceManifest[i].completeAcceptedUnion = true
+		}
+		if sourceManifest[i].id == "openai-cross-product-lifecycle-v2" {
+			sourceManifest[i].lifecycleCoversAcceptedUnion = true
+		}
+	}
+	fullEvidence := EvaluateProductAvailability(startup, []string{"gpt-4o-audio-preview", "gpt-5.4", "gpt-5.5"}, now)
+	byID = map[string]ProductModelAvailability{}
+	for _, item := range fullEvidence {
+		byID[item.ModelID] = item
+	}
+	if byID["gpt-4o-audio-preview"].Status != "unavailable" || byID["gpt-4o-audio-preview"].MatchKind != "accepted_union_absence" {
+		t.Fatalf("only an audited complete accepted-union catalog can establish absence for specialized model families: %+v", byID["gpt-4o-audio-preview"])
+	}
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_version_floor" {
+		t.Fatalf("version-floor exclusion should remain independently attributed: %+v", byID["gpt-5.4"])
+	}
+	if byID["gpt-5.5"].Status != "unavailable" || byID["gpt-5.5"].MatchKind != "accepted_union_retirement" {
+		t.Fatalf("only an audited accepted-union lifecycle source can establish retirement: %+v", byID["gpt-5.5"])
+	}
+}
+
+func TestOlderVersionsBelowOfficialProductFloorAreUnavailable(t *testing.T) {
+	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	openAI := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, false)
+	openAIAvailability := EvaluateProductAvailability(openAI, []string{
+		"gpt-5.2", "gpt-5.4", "gpt-5.5-openai-compact", "gpt-5.6",
+	}, now)
+	byID := make(map[string]ProductModelAvailability, len(openAIAvailability))
+	for _, item := range openAIAvailability {
+		byID[item.ModelID] = item
+	}
+	for _, id := range []string{"gpt-5.2", "gpt-5.4", "gpt-5.5-openai-compact"} {
+		item := byID[id]
+		if item.Status != "unavailable" || item.MatchKind != "accepted_union_version_floor" || len(item.SourceIDs) != 1 || item.SourceIDs[0] != "openai-codex-models" {
+			t.Errorf("older GPT version %s must be rejected by the official current-version floor: %+v", id, item)
+		}
+	}
+	if olderThanProductVersionFloor("openai_codex_chatgpt_login", "gpt-5.3-codex-spark", []string{"gpt-5.6", "gpt-6"}) {
+		t.Error("the distinct Codex Spark family must not be compared against the base GPT version floor")
+	}
+	if byID["gpt-5.6"].Status != "available" {
+		t.Errorf("the model at the official version floor must remain available: %+v", byID["gpt-5.6"])
+	}
+
+	grok := makeProductScopeResult(t, "xai_grok_web_login", now, false, false)
+	grokAvailability := EvaluateProductAvailability(grok, []string{"grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7"}, now)
+	byID = make(map[string]ProductModelAvailability, len(grokAvailability))
+	for _, item := range grokAvailability {
+		byID[item.ModelID] = item
+	}
+	if byID["grok-4.3"].Status != "unavailable" || byID["grok-4.3"].MatchKind != "accepted_union_version_floor" {
+		t.Errorf("older Grok version must be rejected by the official current-version floor: %+v", byID["grok-4.3"])
+	}
+	if byID["grok-4.5"].Status != "available" {
+		t.Errorf("the model at the official Grok web floor must remain available: %+v", byID["grok-4.5"])
+	}
+	for _, id := range []string{"grok-4.6", "grok-4.7"} {
+		if byID[id].Status != "insufficient_evidence" {
+			t.Errorf("a newer but unlisted Grok version must remain unknown: %+v", byID[id])
+		}
+	}
+}
+
+func addTestProductLifecycleEvidence(t *testing.T, startup *StartupSyncResult, sourceID, modelID, status, effectiveAt string, now time.Time) {
+	t.Helper()
+	spec, ok := sourceForID(sourceID)
+	if !ok {
+		t.Fatalf("test source %q was not found", sourceID)
+	}
+	for i := range startup.Providers {
+		result := &startup.Providers[i]
+		if result.SourceID != sourceID || result.Snapshot == nil || len(result.Snapshot.Pages) == 0 {
+			continue
+		}
+		snapshot := *result.Snapshot
+		page := snapshot.Pages[0]
+		evidence := LifecycleEvidence{
+			SourceID: sourceID, Provider: spec.provider, Scope: spec.scope, ModelID: modelID, Status: status,
+			EffectiveAt: effectiveAt, SourceURL: page.URL, SourceTitle: page.Title, RetrievedAt: now,
+			ContentSHA256: page.ContentSHA256, Excerpt: "synthetic test source-surface evidence",
+		}
+		page.Evidence = append(page.Evidence, evidence)
+		snapshot.Pages[0] = page
+		snapshot.Evidence = append(snapshot.Evidence, evidence)
+		result.Snapshot = &snapshot
+		return
+	}
+	t.Fatalf("test startup did not include source %q", sourceID)
 }
 
 func makeProductScopeResult(t *testing.T, scope string, fetchedAt time.Time, omitLast bool, includeNearRetirement bool) StartupSyncResult {
@@ -367,30 +899,42 @@ func makeProductScopeResult(t *testing.T, scope string, fetchedAt time.Time, omi
 		if spec.scope != scope {
 			continue
 		}
-		if omitLast && spec.id == "openai-codex-changelog" {
+		if omitLast && spec.id == "openai-cross-product-lifecycle-v2" {
 			continue
 		}
 		body := fixture(t, map[string]string{
-			"openai-codex-models":            "openai-codex-models.html",
-			"openai-codex-changelog":         "openai-codex-changelog.html",
-			"anthropic-claude-release-notes": "anthropic-claude-release-notes.html",
-			"kimi-code-models":               "kimi-code-models.html",
-			"kimi-code-whats-new":            "kimi-code-whats-new.html",
+			"openai-codex-models":               "openai-codex-models.html",
+			"openai-cross-product-lifecycle-v2": "openai-cross-product-lifecycle.html",
+			"openai-chatgpt-models":             "openai-chatgpt-models.html",
+			"openai-chatgpt-gpt6-announcement":  "openai-gpt6-for-everyone.html",
+			"anthropic-claude-code-models":      "anthropic-claude-code-models.html",
+			"anthropic-claude-web-models":       "anthropic-claude-web-models.html",
+			"anthropic-claude-release-notes":    "anthropic-claude-release-notes.html",
+			"kimi-code-models":                  "kimi-code-models.html",
+			"kimi-web-models":                   "kimi-web-models.html",
+			"kimi-code-whats-new":               "kimi-code-whats-new.html",
+			"xai-grok-web-models":               "xai-grok-4-5-everywhere.html",
 		}[spec.id])
-		if includeNearRetirement && spec.id == "openai-codex-changelog" {
-			body = []byte(strings.Replace(string(body), "</body>", "<p>gpt-near-sixty-test will be retired on December 13, 2026.</p><p>gpt-near-sixty-one-test will be retired on December 14, 2026.</p><p>gpt-retired-today-test will be retired on October 14, 2026.</p><p>gpt-retired-past-test was retired on September 14, 2026.</p></body>", 1))
+		if includeNearRetirement && spec.id == "openai-cross-product-lifecycle-v2" {
+			// Boundary dates are added as normalized evidence below.
 		}
 		parsed, err := parseSourcePage(spec, spec.rootURL, body, fetchedAt)
 		if err != nil {
 			t.Fatal(err)
 		}
-		page := CachedPage{URL: spec.rootURL, Title: parsed.Title, ContentSHA256: sha256Hex(body), FetchedAt: fetchedAt, Evidence: parsed.Evidence}
+		page := CachedPage{URL: spec.rootURL, Title: parsed.Title, ContentSHA256: sha256Hex(body), FetchedAt: fetchedAt, Evidence: parsed.Evidence, AvailableModelIDs: parsed.AvailableModelIDs}
 		snapshot := CatalogSnapshot{SourceID: spec.id, Provider: spec.provider, Scope: spec.scope, Pages: []CachedPage{page}, Evidence: parsed.Evidence, FetchedAt: fetchedAt, CheckedAt: fetchedAt, Complete: true}
 		snapshot.ContentSHA256, err = snapshotDigest(snapshot.Pages)
 		if err != nil {
 			t.Fatal(err)
 		}
 		result.Providers = append(result.Providers, ProviderSync{SourceID: spec.id, Provider: spec.provider, Scope: spec.scope, Status: "updated", Snapshot: &snapshot})
+	}
+	if includeNearRetirement {
+		addTestProductLifecycleEvidence(t, &result, "openai-cross-product-lifecycle-v2", "gpt-near-sixty-test", "announced_deprecated", "2026-12-13", fetchedAt)
+		addTestProductLifecycleEvidence(t, &result, "openai-cross-product-lifecycle-v2", "gpt-near-sixty-one-test", "announced_deprecated", "2026-12-14", fetchedAt)
+		addTestProductLifecycleEvidence(t, &result, "openai-cross-product-lifecycle-v2", "gpt-retired-today-test", "retired", "2026-10-14", fetchedAt)
+		addTestProductLifecycleEvidence(t, &result, "openai-cross-product-lifecycle-v2", "gpt-retired-past-test", "retired", "2026-09-14", fetchedAt)
 	}
 	return result
 }
@@ -637,18 +1181,26 @@ func fixtureRouter(t *testing.T, fail bool) *fakeDoer {
 func fixtureRouterWithOverrides(t *testing.T, fail bool, overrides map[string]string) *fakeDoer {
 	t.Helper()
 	bodies := map[string]string{
-		"developers.openai.com/api/docs/deprecations":                 string(fixture(t, "openai-deprecations.html")),
-		"platform.claude.com/docs/en/about-claude/model-deprecations": string(fixture(t, "anthropic-deprecations.html")),
-		"api-docs.deepseek.com/updates/":                              string(fixture(t, "deepseek-updates.html")),
-		"help.aliyun.com/zh/model-studio/model-depreciation":          string(fixture(t, "alibaba-depreciation.html")),
-		"t.aliyun.com/abs/bulletin/bulletinDetail":                    string(fixture(t, "alibaba-bulletin-response.json")),
-		"docs.x.ai/developers/release-notes":                          string(fixture(t, "xai-release-notes.html")),
-		"docs.x.ai/developers/migration/retirement-test":              string(fixture(t, "xai-migration.html")),
-		"developers.openai.com/codex/models":                          string(fixture(t, "openai-codex-models.html")),
-		"learn.chatgpt.com/docs/changelog":                            string(fixture(t, "openai-codex-changelog.html")),
-		"support.claude.com/en/articles/12138966-release-notes":       string(fixture(t, "anthropic-claude-release-notes.html")),
-		"www.kimi.com/help/kimi-code/models":                          string(fixture(t, "kimi-code-models.html")),
-		"www.kimi.com/code/docs/en/kimi-code/whats-new.html":          string(fixture(t, "kimi-code-whats-new.html")),
+		"developers.openai.com/api/docs/deprecations":                                                 string(fixture(t, "openai-deprecations.html")),
+		"platform.claude.com/docs/en/about-claude/model-deprecations":                                 string(fixture(t, "anthropic-deprecations.html")),
+		"api-docs.deepseek.com/updates/":                                                              string(fixture(t, "deepseek-updates.html")),
+		"help.aliyun.com/zh/model-studio/model-depreciation":                                          string(fixture(t, "alibaba-depreciation.html")),
+		"t.aliyun.com/abs/bulletin/bulletinDetail":                                                    string(fixture(t, "alibaba-bulletin-response.json")),
+		"docs.x.ai/developers/release-notes":                                                          string(fixture(t, "xai-release-notes.html")),
+		"docs.x.ai/developers/migration/retirement-test":                                              string(fixture(t, "xai-migration.html")),
+		"x.ai/news/grok-4-7":                                                                          string(fixture(t, "xai-grok-4-7-wrong-surface.html")),
+		"x.ai/news/grok-4-6-on-api":                                                                   string(fixture(t, "xai-grok-4-7-wrong-surface.html")),
+		"x.ai/news/grok-4-5-everywhere":                                                               string(fixture(t, "xai-grok-4-5-everywhere.html")),
+		"openai.com/index/gpt-6-for-everyone/":                                                        string(fixture(t, "openai-gpt6-for-everyone.html")),
+		"developers.openai.com/codex/models":                                                          string(fixture(t, "openai-codex-models.html")),
+		"help.openai.com/en/articles/20001354-gpt-6-and-other-models-in-chatgpt":                      string(fixture(t, "openai-chatgpt-models.html")),
+		"learn.chatgpt.com/docs/changelog":                                                            string(fixture(t, "openai-cross-product-lifecycle.html")),
+		"support.claude.com/en/articles/12138966-release-notes":                                       string(fixture(t, "anthropic-claude-release-notes.html")),
+		"support.claude.com/en/articles/11940350-claude-code-model-configuration":                     string(fixture(t, "anthropic-claude-code-models.html")),
+		"support.claude.com/en/articles/8606394-how-large-is-the-context-window-on-paid-claude-plans": string(fixture(t, "anthropic-claude-web-models.html")),
+		"www.kimi.com/en/help/kimi-code/models":                                                       string(fixture(t, "kimi-code-models.html")),
+		"www.kimi.com/en/help/new-user-guide/agentic-chat":                                            string(fixture(t, "kimi-web-models.html")),
+		"www.kimi.com/code/docs/en/kimi-code/whats-new.html":                                          string(fixture(t, "kimi-code-whats-new.html")),
 	}
 	for key, body := range overrides {
 		bodies[key] = body
@@ -759,29 +1311,44 @@ func TestValidZeroEventOfficialPagesUpdateCompleteSnapshotsAndRemainUnknown(t *t
 	}
 }
 
-func TestStartupAnonymousFixedSourcesBoundsAndNoCredentialLookup(t *testing.T) {
+func TestStartupFixedPublicSourcesAndOptionalAccountCatalogCredentials(t *testing.T) {
 	doer := fixtureRouter(t, false)
 	envCalls, clientCalls := 0, 0
+	var envMu sync.Mutex
+	envNames := make([]string, 0, 4)
 	result := SyncStartup(context.Background(), StartupSyncOptions{
-		CacheDir:  filepath.Join(t.TempDir(), "cache"),
-		LookupEnv: func(string) (string, bool) { envCalls++; return "must-not-be-read", true },
-		NewDoer:   func() HTTPDoer { clientCalls++; return doer },
-		Now:       time.Now,
+		CacheDir: filepath.Join(t.TempDir(), "cache"),
+		LookupEnv: func(name string) (string, bool) {
+			if name != "VOLCENGINE_ARK_CREDENTIAL_FILE" && name != "DASHSCOPE_API_KEY" && name != "DASHSCOPE_API_KEY_FILE" && name != "CREDENTIALS_DIRECTORY" {
+				t.Fatalf("unexpected environment variable lookup: %s", name)
+			}
+			envMu.Lock()
+			envCalls++
+			envNames = append(envNames, name)
+			envMu.Unlock()
+			return "", false
+		},
+		NewDoer: func() HTTPDoer { clientCalls++; return doer },
+		Now:     time.Now,
 	})
-	if envCalls != 0 {
-		t.Fatalf("OEM environment queried %d times", envCalls)
+	seenEnv := map[string]int{}
+	for _, name := range envNames {
+		seenEnv[name]++
+	}
+	if envCalls != 4 || seenEnv["DASHSCOPE_API_KEY"] != 1 || seenEnv["DASHSCOPE_API_KEY_FILE"] != 1 || seenEnv["CREDENTIALS_DIRECTORY"] != 1 || seenEnv["VOLCENGINE_ARK_CREDENTIAL_FILE"] != 1 {
+		t.Fatalf("optional account-catalog credential lookups=%d names=%v", envCalls, envNames)
 	}
 	if clientCalls != 1 {
 		t.Fatalf("HTTP client constructions=%d want 1", clientCalls)
 	}
-	if len(result.Providers) != 10 {
-		t.Fatalf("sources=%d want 10", len(result.Providers))
+	if len(result.Providers) != 18 {
+		t.Fatalf("sources=%d want 18", len(result.Providers))
 	}
 	doer.mu.Lock()
 	requests, max := append([]*http.Request(nil), doer.requests...), doer.maxActive
 	doer.mu.Unlock()
-	if len(requests) != 12 {
-		t.Fatalf("GET count=%d want 12 (ten roots, one Alibaba notice and one xAI migration)", len(requests))
+	if len(requests) != 18 {
+		t.Fatalf("public GET count=%d want 18 after excluding the non-probative Grok overview)", len(requests))
 	}
 	if max > 4 {
 		t.Fatalf("concurrent requests=%d exceeds 4", max)
@@ -804,6 +1371,12 @@ func TestStartupAnonymousFixedSourcesBoundsAndNoCredentialLookup(t *testing.T) {
 		}
 	}
 	for _, item := range result.Providers {
+		if item.SourceID == "volcengine-ark-account-models" || item.SourceID == "alibaba-model-studio-models" {
+			if item.Status != "unavailable" || item.ErrorCode != "credential_not_configured" {
+				t.Errorf("unconfigured Ark source unexpectedly made a request: %+v", item)
+			}
+			continue
+		}
 		if item.Status != "updated" || item.Snapshot == nil {
 			t.Errorf("%s startup result: %+v", item.Provider, item)
 		}
@@ -979,7 +1552,7 @@ func TestConfiguredProxyValidationCoversOnlyFixedSourceHosts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, host := range []string{"developers.openai.com", "platform.claude.com", "api-docs.deepseek.com", "help.aliyun.com", "t.aliyun.com", "docs.x.ai", "learn.chatgpt.com", "support.claude.com", "www.kimi.com"} {
+	for _, host := range []string{"developers.openai.com", "platform.claude.com", "api-docs.deepseek.com", "help.aliyun.com", "t.aliyun.com", "docs.x.ai", "learn.chatgpt.com", "support.claude.com", "www.kimi.com", "ark.cn-beijing.volcengineapi.com"} {
 		if !seen[host] {
 			t.Errorf("proxy preflight omitted fixed official host %s", host)
 		}
@@ -1116,7 +1689,7 @@ func TestRedirectAndChildURLAllowlistBudget(t *testing.T) {
 	}
 }
 
-func TestLogicalDocumentsAndRedirectsStopAtGlobal102GETLimit(t *testing.T) {
+func TestGlobal102GETLimitHoldsAcrossManifestRootsAndMaximumGrokChildren(t *testing.T) {
 	logicalURLs := make([]string, 0, 10+MaxAlibabaNotices+MaxXAIMigrations)
 	for _, provider := range []string{"openai", "anthropic", "deepseek"} {
 		logicalURLs = append(logicalURLs, specFor(t, provider).rootURL)
@@ -1139,11 +1712,26 @@ func TestLogicalDocumentsAndRedirectsStopAtGlobal102GETLimit(t *testing.T) {
 		}
 		logicalURLs = append(logicalURLs, children...)
 	}
-	for _, sourceID := range []string{"openai-codex-models", "openai-codex-changelog", "anthropic-claude-release-notes", "kimi-code-models", "kimi-code-whats-new"} {
+	for _, sourceID := range []string{
+		"openai-codex-models", "openai-chatgpt-models", "openai-chatgpt-gpt6-announcement", "openai-cross-product-lifecycle-v2",
+		"anthropic-claude-code-models", "anthropic-claude-web-models", "anthropic-claude-release-notes",
+		"kimi-code-models", "kimi-web-models", "kimi-code-whats-new", "xai-grok-web-models",
+		"volcengine-ark-account-models", "alibaba-model-studio-models",
+	} {
 		logicalURLs = append(logicalURLs, specForID(t, sourceID).rootURL)
 	}
-	if len(logicalURLs) != 34 {
-		t.Fatalf("logical document upper bound=%d want 34", len(logicalURLs))
+	grokSpec := specForID(t, "xai-grok-web-models")
+	grokLinks := make([]string, grokSpec.maxChildren)
+	for i := range grokLinks {
+		grokLinks[i] = "https://x.ai/news/grok-model-" + strconv.Itoa(i)
+	}
+	grokChildren, err := validateChildren(grokSpec, grokSpec.rootURL, grokLinks)
+	if err != nil || len(grokChildren) != MaxXAIGrokNewsArticles {
+		t.Fatalf("maximum Grok child URL set=%d err=%v", len(grokChildren), err)
+	}
+	logicalURLs = append(logicalURLs, grokChildren...)
+	if len(logicalURLs) != 106 {
+		t.Fatalf("representative logical document set=%d want 106", len(logicalURLs))
 	}
 	var requestCount int
 	doer := &fakeDoer{handler: func(req *http.Request) (*http.Response, error) {
@@ -1151,6 +1739,7 @@ func TestLogicalDocumentsAndRedirectsStopAtGlobal102GETLimit(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{req.URL.String()}}, Body: io.NopCloser(strings.NewReader(""))}, nil
 	}}
 	budget := &requestBudget{}
+	budgetExhausted := false
 	for _, raw := range logicalURLs {
 		var spec sourceSpec
 		found := false
@@ -1163,12 +1752,19 @@ func TestLogicalDocumentsAndRedirectsStopAtGlobal102GETLimit(t *testing.T) {
 		if !found {
 			t.Fatalf("logical URL is outside source manifest: %s", raw)
 		}
+		before := requestCount
 		_, err := fetchAndParsePage(context.Background(), spec, raw, CachedPage{}, false, doer, budget, time.Now)
-		if failureCode(err) != "redirect_limit_exceeded" {
-			t.Fatalf("redirect chain for %s did not stop at two redirects: %v", raw, err)
+		code := failureCode(err)
+		if code == "source_request_budget_exceeded" {
+			budgetExhausted = true
+			if requestCount != before {
+				t.Fatalf("request after global budget was sent for %s", raw)
+			}
+		} else if code != "redirect_limit_exceeded" {
+			t.Fatalf("redirect chain for %s had unexpected result: %v", raw, err)
 		}
 	}
-	if requestCount != MaxHTTPGets || budget.count() != MaxHTTPGets {
+	if !budgetExhausted || requestCount != MaxHTTPGets || budget.count() != MaxHTTPGets {
 		t.Fatalf("worst-case requests=%d budget=%d want %d", requestCount, budget.count(), MaxHTTPGets)
 	}
 	if _, err := fetchAndParsePage(context.Background(), specFor(t, "openai"), specFor(t, "openai").rootURL, CachedPage{}, false, doer, budget, time.Now); failureCode(err) != "source_request_budget_exceeded" {
@@ -1260,7 +1856,16 @@ func TestLiveSmokeOfficialLifecycleSources(t *testing.T) {
 	parsedCount, parseErrorCount, unavailableCount := 0, 0, 0
 	for _, provider := range result.Providers {
 		parserStatus := liveParserStatus(provider)
-		t.Logf("public source provider=%s http=%s parser=%s status=%s evidence=%d error=%s title=%q", provider.Provider, liveHTTPStatus(provider.Provider, observed), parserStatus, provider.Status, provider.EvidenceCount, provider.ErrorCode, provider.PageTitle)
+		catalogCount, catalogComplete := 0, false
+		catalogIDs := make([]string, 0)
+		if provider.Snapshot != nil {
+			catalogComplete = provider.Snapshot.Complete
+			for _, page := range provider.Snapshot.Pages {
+				catalogCount += len(page.AvailableModelIDs)
+				catalogIDs = append(catalogIDs, page.AvailableModelIDs...)
+			}
+		}
+		t.Logf("public source id=%s provider=%s http=%s parser=%s status=%s evidence=%d catalog_models=%d catalog_complete=%v catalog_ids=%q error=%s title=%q", provider.SourceID, provider.Provider, liveHTTPStatus(provider.Provider, observed), parserStatus, provider.Status, provider.EvidenceCount, catalogCount, catalogComplete, catalogIDs, provider.ErrorCode, provider.PageTitle)
 		if provider.Provider == "alibaba" && provider.Snapshot != nil {
 			byModel := make(map[string][]LifecycleEvidence)
 			for _, page := range provider.Snapshot.Pages {
@@ -1305,8 +1910,22 @@ func TestLiveSmokeOfficialLifecycleSources(t *testing.T) {
 		}
 	}
 	t.Logf("live source summary parsed=%d parse_error=%d unavailable_or_http_failure=%d total=%d", parsedCount, parseErrorCount, unavailableCount, len(result.Providers))
+	loggedScopes := make(map[string]bool)
+	for _, provider := range result.Providers {
+		if provider.Scope == "" || provider.Scope == "api" || provider.Scope == "volcengine_ark_account_activation" || provider.Scope == "alibaba_model_studio_beijing_api_catalog" || loggedScopes[provider.Scope] {
+			continue
+		}
+		loggedScopes[provider.Scope] = true
+		catalog, ready := CurrentModelCatalog(result, provider.Scope, time.Now())
+		t.Logf("live product union scope=%s ready=%v complete=%v sources=%v model_ids=%q", provider.Scope, ready, catalog.Complete, catalog.SourceIDs, catalog.ModelIDs)
+	}
 	observed.mu.Lock()
 	defer observed.mu.Unlock()
+	for _, result := range observed.results {
+		if strings.Contains(result.URL, "x.ai/news/") || strings.Contains(result.URL, "help.openai.com/en/articles/20001354") {
+			t.Logf("product catalog GET url=%s http=%d transport_error=%v", result.URL, result.StatusCode, result.TransportError)
+		}
+	}
 	if len(observed.requests) == 0 || len(observed.requests) > MaxHTTPGets {
 		t.Fatalf("live request count=%d outside 1..%d", len(observed.requests), MaxHTTPGets)
 	}
@@ -1358,6 +1977,9 @@ func TestStartupFailurePreservesLastGoodAndOfflineDoesNotNetwork(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cache")
 	first := SyncStartup(context.Background(), StartupSyncOptions{CacheDir: root, NewDoer: func() HTTPDoer { return fixtureRouter(t, false) }, Now: time.Now})
 	for _, item := range first.Providers {
+		if item.SourceID == "volcengine-ark-account-models" || item.SourceID == "alibaba-model-studio-models" {
+			continue
+		}
 		if item.Status != "updated" {
 			t.Fatalf("initial source sync failed: %+v", item)
 		}
@@ -1369,6 +1991,9 @@ func TestStartupFailurePreservesLastGoodAndOfflineDoesNotNetwork(t *testing.T) {
 	failedDoer := fixtureRouter(t, true)
 	second := SyncStartup(context.Background(), StartupSyncOptions{CacheDir: root, NewDoer: func() HTTPDoer { return failedDoer }, Now: time.Now})
 	for _, item := range second.Providers {
+		if item.SourceID == "volcengine-ark-account-models" || item.SourceID == "alibaba-model-studio-models" {
+			continue
+		}
 		if item.Status != "stale" || item.Snapshot == nil {
 			t.Errorf("failed refresh did not retain last-good: %+v", item)
 		}
@@ -1380,12 +2005,30 @@ func TestStartupFailurePreservesLastGoodAndOfflineDoesNotNetwork(t *testing.T) {
 	if prior.ContentSHA256 != after.ContentSHA256 || !prior.CheckedAt.Equal(after.CheckedAt) {
 		t.Fatal("failed refresh replaced the last-good snapshot")
 	}
+	failedDoer.mu.Lock()
+	requestsBeforeOffline := len(failedDoer.requests)
+	failedDoer.mu.Unlock()
 	lookupCalls, clients := 0, 0
 	offline := SyncStartup(context.Background(), StartupSyncOptions{Offline: true, CacheDir: root, LookupEnv: func(string) (string, bool) { lookupCalls++; return "x", true }, NewDoer: func() HTTPDoer { clients++; return failedDoer }})
-	if lookupCalls != 0 || clients != 0 || len(failedDoer.requests) != 10 {
-		t.Fatalf("offline path touched network or credentials: lookups=%d clients=%d requests=%d", lookupCalls, clients, len(failedDoer.requests))
+	failedDoer.mu.Lock()
+	requestsAfterOffline := len(failedDoer.requests)
+	failedDoer.mu.Unlock()
+	if lookupCalls != 0 || clients != 0 || requestsAfterOffline != requestsBeforeOffline {
+		t.Fatalf("offline path touched network or credentials: lookups=%d clients=%d requests before=%d after=%d", lookupCalls, clients, requestsBeforeOffline, requestsAfterOffline)
 	}
 	for _, item := range offline.Providers {
+		if item.SourceID == "volcengine-ark-account-models" {
+			if item.Status != "offline_cache_missing" {
+				t.Errorf("unconfigured Ark offline state is unexpected: %+v", item)
+			}
+			continue
+		}
+		if item.SourceID == "alibaba-model-studio-models" {
+			if item.Status != "offline_cache_missing" {
+				t.Errorf("unconfigured Model Studio offline state is unexpected: %+v", item)
+			}
+			continue
+		}
 		if item.Status != "offline_cached" {
 			t.Errorf("offline cache status=%+v", item)
 		}

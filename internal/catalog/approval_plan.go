@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const ApprovalPlanSchemaVersion = 5
+const ApprovalPlanSchemaVersion = 6
 const ApprovalPlanTTL = 15 * time.Minute
 
 type TargetBinding struct {
@@ -23,16 +23,38 @@ type TargetBinding struct {
 // file's raw bytes are hashed separately by the CLI and are never reserialized
 // before confirmation.
 type ApprovalPlan struct {
-	SchemaVersion          int           `json:"schema_version"`
-	CreatedAt              time.Time     `json:"created_at"`
-	ExpiresAt              time.Time     `json:"expires_at"`
-	Target                 TargetBinding `json:"target"`
-	AccountScope           string        `json:"account_scope"`
-	AccountInventoryCount  int           `json:"account_inventory_count,omitempty"`
-	AccountInventorySHA256 string        `json:"account_inventory_sha256,omitempty"`
-	RulesSHA256            string        `json:"rules_sha256"`
-	StateSHA256            string        `json:"state_sha256"`
-	Accounts               []Plan        `json:"accounts"`
+	SchemaVersion          int                  `json:"schema_version"`
+	CreatedAt              time.Time            `json:"created_at"`
+	ExpiresAt              time.Time            `json:"expires_at"`
+	Target                 TargetBinding        `json:"target"`
+	AccountScope           string               `json:"account_scope"`
+	AccountInventoryCount  int                  `json:"account_inventory_count,omitempty"`
+	AccountInventorySHA256 string               `json:"account_inventory_sha256,omitempty"`
+	RulesSHA256            string               `json:"rules_sha256"`
+	StateSHA256            string               `json:"state_sha256"`
+	ModelProbeDecisions    []ModelProbeDecision `json:"model_probe_decisions,omitempty"`
+	ModelProbeSHA256       string               `json:"model_probe_sha256,omitempty"`
+	Accounts               []Plan               `json:"accounts"`
+}
+
+type ModelProbeOutcome struct {
+	AccountID int64  `json:"account_id"`
+	Outcome   string `json:"outcome"`
+}
+
+type ModelProbeDecision struct {
+	Provider      string                   `json:"provider,omitempty"`
+	ModelID       string                   `json:"model_id"`
+	Status        string                   `json:"status"` // available, unavailable, or ignored
+	ScopeAccounts []ModelProbeScopeAccount `json:"scope_accounts"`
+	Accounts      []ModelProbeOutcome      `json:"accounts"`
+}
+
+// ModelProbeScopeAccount binds every active exact-model mapping in the provider
+// namespace, including accounts excluded from probing by official evidence.
+type ModelProbeScopeAccount struct {
+	AccountID int64  `json:"account_id"`
+	Reason    string `json:"reason"` // probe, official_available, official_unavailable
 }
 
 func (p ApprovalPlan) ValidateShape(now time.Time) error {
@@ -55,9 +77,20 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 	} else if p.AccountInventoryCount != 0 || p.AccountInventorySHA256 != "" {
 		return errors.New("allowlist plan unexpectedly contains an all-account inventory")
 	}
+	if len(p.ModelProbeDecisions) == 0 {
+		if p.ModelProbeSHA256 != "" {
+			return errors.New("approval plan contains an empty model-probe digest")
+		}
+	} else {
+		digest, err := ModelProbeDigest(p.ModelProbeDecisions)
+		if err != nil || digest != p.ModelProbeSHA256 {
+			return errors.New("approval plan model-probe evidence is invalid or its hash does not match")
+		}
+	}
 	seen := map[int64]bool{}
+	probeParticipants := map[string]map[int64]string{}
 	for _, account := range p.Accounts {
-		if account.AccountID <= 0 || seen[account.AccountID] || account.Before == nil || account.After == nil || account.AbsenceCountsBefore == nil || account.AbsenceCountsAfter == nil || !validAbsenceCounts(account.AbsenceCountsBefore) || !validAbsenceCounts(account.AbsenceCountsAfter) || account.Conflicts == nil || account.CatalogObservedAt.IsZero() || !validSHA256(account.DirectoryHash) || !validSHA256(account.SourceFingerprint) || !validSHA256(account.LifecycleEvidenceSHA256) || (account.ApplyEligible && (!validOfficialSelectabilityScope(account.OfficialSelectabilityScope) || !validSHA256(account.OfficialSelectabilitySHA256) || account.OfficialSelectabilityObservedAt.IsZero() || account.OfficialSelectabilityExpiresAt.IsZero())) || (account.OfficialSelectabilityObservedAt.IsZero() != account.OfficialSelectabilityExpiresAt.IsZero()) || (!account.OfficialSelectabilityObservedAt.IsZero() && (!account.OfficialSelectabilityExpiresAt.After(account.OfficialSelectabilityObservedAt) || account.OfficialSelectabilityExpiresAt.Sub(account.OfficialSelectabilityObservedAt) > OfficialSelectabilityMaxAge)) || (account.IdentityCatalogPolicy != "" && account.IdentityCatalogPolicy != "replace_identity_from_live_list" && account.IdentityCatalogPolicy != "add_identity_from_live_list") {
+		if account.AccountID <= 0 || seen[account.AccountID] || account.Before == nil || account.After == nil || account.AbsenceCountsBefore == nil || account.AbsenceCountsAfter == nil || !validAbsenceCounts(account.AbsenceCountsBefore) || !validAbsenceCounts(account.AbsenceCountsAfter) || account.Conflicts == nil || account.CatalogObservedAt.IsZero() || !validSHA256(account.DirectoryHash) || !validSHA256(account.SourceFingerprint) || !validSHA256(account.LifecycleEvidenceSHA256) || (account.OfficialSelectabilitySHA256 == "" && (!account.OfficialSelectabilityObservedAt.IsZero() || !account.OfficialSelectabilityExpiresAt.IsZero() || account.OfficialSelectabilityScope != "")) || (account.OfficialSelectabilitySHA256 != "" && (!validOfficialSelectabilityScope(account.OfficialSelectabilityScope) || !validSHA256(account.OfficialSelectabilitySHA256) || account.OfficialSelectabilityObservedAt.IsZero() || account.OfficialSelectabilityExpiresAt.IsZero())) || (account.OfficialSelectabilityObservedAt.IsZero() != account.OfficialSelectabilityExpiresAt.IsZero()) || (!account.OfficialSelectabilityObservedAt.IsZero() && (!account.OfficialSelectabilityExpiresAt.After(account.OfficialSelectabilityObservedAt) || account.OfficialSelectabilityExpiresAt.Sub(account.OfficialSelectabilityObservedAt) > OfficialSelectabilityMaxAge)) || (account.IdentityCatalogPolicy != "" && account.IdentityCatalogPolicy != "replace_identity_from_live_list" && account.IdentityCatalogPolicy != "add_identity_from_live_list") {
 			return errors.New("approval plan contains an invalid account snapshot")
 		}
 		for i, scope := range account.LifecycleScopes {
@@ -74,6 +107,41 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 		if err != nil || lifecycleDigest != account.LifecycleEvidenceSHA256 {
 			return errors.New("approval plan lifecycle evidence hash does not match its contents")
 		}
+		if account.ProductAvailabilityEnforced {
+			availabilityDigest, availabilityErr := ProductAvailabilityDigest(account.ProductAvailability)
+			if availabilityErr != nil || availabilityDigest != account.ProductAvailabilitySHA256 {
+				return errors.New("approval plan product availability evidence is invalid or its hash does not match")
+			}
+		} else if account.ProductAvailabilitySHA256 != "" || len(account.ProductAvailability) != 0 {
+			return errors.New("approval plan contains product availability evidence without enforcement")
+		}
+		for _, evidence := range account.ProductAvailability {
+			if evidence.MatchKind != "account_probe_success" && evidence.MatchKind != "all_account_probes_failed" && evidence.MatchKind != "account_probe_ignored" {
+				continue
+			}
+			mapped := false
+			for _, upstreamID := range account.Before {
+				if upstreamID == evidence.ModelID {
+					mapped = true
+					break
+				}
+			}
+			if !mapped {
+				return errors.New("model-probe evidence is attached to an account without that exact current mapping")
+			}
+			key := ModelProbeKey(evidence.Provider, evidence.ModelID)
+			if probeParticipants[key] == nil {
+				probeParticipants[key] = map[int64]string{}
+			}
+			if _, duplicate := probeParticipants[key][account.AccountID]; duplicate {
+				return errors.New("model-probe account evidence is duplicated")
+			}
+			participantStatus := evidence.Status
+			if evidence.MatchKind == "account_probe_ignored" {
+				participantStatus = "ignored"
+			}
+			probeParticipants[key][account.AccountID] = participantStatus
+		}
 		seen[account.AccountID] = true
 		if account.Source.AccountID != 0 && account.Source.AccountID != account.AccountID || SourceFingerprint(account.Source) != account.SourceFingerprint {
 			return errors.New("approval plan source identity does not match its fingerprint")
@@ -89,8 +157,154 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 			return errors.New("approval plan after mapping is invalid")
 		}
 	}
+	if len(probeParticipants) != len(p.ModelProbeDecisions) {
+		return errors.New("approval plan model-probe decisions do not match account evidence")
+	}
+	for _, decision := range p.ModelProbeDecisions {
+		key := ModelProbeKey(decision.Provider, decision.ModelID)
+		participants := probeParticipants[key]
+		if len(participants) != len(decision.Accounts) {
+			return errors.New("approval plan model-probe account scope is incomplete")
+		}
+		for _, outcome := range decision.Accounts {
+			status, found := participants[outcome.AccountID]
+			if !found {
+				return errors.New("approval plan model-probe account scope does not match the participating account plans")
+			}
+			if status != decision.Status {
+				return errors.New("approval plan model-probe aggregate disagrees with account availability evidence")
+			}
+		}
+		seenScope := map[int64]bool{}
+		for _, scope := range decision.ScopeAccounts {
+			if scope.AccountID <= 0 || seenScope[scope.AccountID] {
+				return errors.New("approval plan model-probe scope manifest is invalid")
+			}
+			seenScope[scope.AccountID] = true
+			if scope.Reason == "probe" {
+				if _, ok := participants[scope.AccountID]; !ok {
+					return errors.New("model-probe scope does not match participating accounts")
+				}
+			} else if scope.Reason != "official_available" && scope.Reason != "official_unavailable" && scope.Reason != "other_provider" {
+				return errors.New("approval plan model-probe scope reason is invalid")
+			}
+		}
+		expectedScope := make(map[int64]string)
+		for _, account := range p.Accounts {
+			mapped := false
+			for _, upstreamID := range account.Before {
+				if upstreamID == decision.ModelID {
+					mapped = true
+					break
+				}
+			}
+			if !mapped || !account.ProductAvailabilityEnforced {
+				continue
+			}
+			var match *ProductModelAvailability
+			for i := range account.ProductAvailability {
+				if account.ProductAvailability[i].ModelID == decision.ModelID {
+					match = &account.ProductAvailability[i]
+					break
+				}
+			}
+			if match == nil {
+				continue
+			}
+			if match.Provider != decision.Provider {
+				expectedScope[account.AccountID] = "other_provider"
+				continue
+			}
+			reason := "probe"
+			if match.MatchKind != "account_probe_success" && match.MatchKind != "all_account_probes_failed" && match.MatchKind != "account_probe_ignored" {
+				switch match.Status {
+				case "available":
+					reason = "official_available"
+				case "unavailable":
+					reason = "official_unavailable"
+				default:
+					continue
+				}
+			}
+			expectedScope[account.AccountID] = reason
+		}
+		if len(expectedScope) != len(decision.ScopeAccounts) {
+			return errors.New("model-probe scope manifest does not match exact-model account plans")
+		}
+		for _, scope := range decision.ScopeAccounts {
+			if expectedScope[scope.AccountID] != scope.Reason {
+				return errors.New("model-probe scope manifest disagrees with account evidence")
+			}
+		}
+	}
 	return nil
 }
+
+func ModelProbeDigest(decisions []ModelProbeDecision) (string, error) {
+	ordered := append([]ModelProbeDecision(nil), decisions...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ModelProbeKey(ordered[i].Provider, ordered[i].ModelID) < ModelProbeKey(ordered[j].Provider, ordered[j].ModelID)
+	})
+	for i, decision := range ordered {
+		key := ModelProbeKey(decision.Provider, decision.ModelID)
+		if !validID(decision.ModelID) || i > 0 && ModelProbeKey(ordered[i-1].Provider, ordered[i-1].ModelID) >= key || decision.Status != "available" && decision.Status != "unavailable" && decision.Status != "ignored" || len(decision.Accounts) == 0 || len(decision.ScopeAccounts) == 0 {
+			return "", errors.New("model-probe decision is invalid or not canonical")
+		}
+		lastScopeID := int64(0)
+		for _, scope := range decision.ScopeAccounts {
+			if scope.AccountID <= lastScopeID || (scope.Reason != "probe" && scope.Reason != "official_available" && scope.Reason != "official_unavailable" && scope.Reason != "other_provider") {
+				return "", errors.New("model-probe scope accounts are invalid or unordered")
+			}
+			lastScopeID = scope.AccountID
+		}
+		succeeded := false
+		failed := 0
+		incomplete := 0
+		previousID := int64(0)
+		seenSuccess := false
+		for _, account := range decision.Accounts {
+			if account.AccountID <= previousID {
+				return "", errors.New("model-probe account outcomes are invalid or unordered")
+			}
+			previousID = account.AccountID
+			switch account.Outcome {
+			case "failed":
+				if seenSuccess {
+					return "", errors.New("model-probe attempt follows a successful account")
+				}
+				failed++
+			case "incomplete":
+				if seenSuccess {
+					return "", errors.New("model-probe attempt follows a successful account")
+				}
+				incomplete++
+			case "succeeded":
+				if seenSuccess {
+					return "", errors.New("model-probe decision contains multiple successful accounts")
+				}
+				seenSuccess = true
+				succeeded = true
+			case "not_attempted_after_success":
+				if !seenSuccess {
+					return "", errors.New("model-probe skipped account has no preceding success")
+				}
+			default:
+				return "", errors.New("model-probe account outcome is invalid")
+			}
+		}
+		if decision.Status == "available" && !succeeded || decision.Status == "unavailable" && (succeeded || incomplete != 0 || failed != len(decision.Accounts)) || decision.Status == "ignored" && (succeeded || incomplete == 0) {
+			return "", errors.New("model-probe aggregate does not match account outcomes")
+		}
+	}
+	body, err := json.Marshal(ordered)
+	if err != nil {
+		return "", errors.New("model-probe evidence digest could not be computed")
+	}
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:]), nil
+}
+
+func ModelProbeKey(provider, modelID string) string { return provider + "\x00" + modelID }
 
 func AccountIDsDigest(ids []int64) (string, error) {
 	ordered := append([]int64(nil), ids...)

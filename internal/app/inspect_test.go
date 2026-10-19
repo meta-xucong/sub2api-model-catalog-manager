@@ -385,6 +385,11 @@ func (f *fakeAdminAPI) SyncUpstream(context.Context, int64) (adminapi.Catalog, e
 	return adminapi.Catalog{}, errors.New("unexpected sync")
 }
 
+func (f *fakeAdminAPI) ProbeModel(context.Context, int64, string) (adminapi.ModelProbeResult, error) {
+	f.calls = append(f.calls, "probe")
+	return adminapi.ModelProbeResult{}, errors.New("unexpected model probe")
+}
+
 func (f *fakeAdminAPI) BulkUpdateMapping(context.Context, int64, map[string]string) (adminapi.BulkUpdateResult, error) {
 	f.calls = append(f.calls, "bulk")
 	return adminapi.BulkUpdateResult{}, errors.New("unexpected write")
