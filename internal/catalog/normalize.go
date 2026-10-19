@@ -908,6 +908,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			continue
 		}
 		if !live[family.PreferredUpstreamID] {
+			if input.ProductAvailabilityEnforced && productStatus[strings.ToLower(family.PreferredUpstreamID)] == "unavailable" {
+				continue // Authoritative product evidence already removed the unavailable exact target.
+			}
 			if selectable == nil && !input.PruneMissingMappings {
 				plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
 			}

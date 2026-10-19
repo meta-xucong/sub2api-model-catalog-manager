@@ -1051,6 +1051,44 @@ func TestPartialProductEvidenceGatesTargetModelsOnly(t *testing.T) {
 	}
 }
 
+func TestMissingVersionFamilyTargetConflictsOnlyWithoutAuthoritativeUnavailability(t *testing.T) {
+	s := sourceFixture()
+	rules := baseRules()
+	rules.VersionFamilies = []VersionFamily{exactFamily(s, "gpt-5.2", "gpt-5.2", FamilyMember{UpstreamID: "gpt-5.2", ExactIDAction: "keep"})}
+	observed := time.Date(2026, 10, 19, 16, 36, 0, 0, time.UTC)
+	unavailable := ProductModelAvailability{
+		ModelID: "gpt-5.2", Provider: "openai", Status: "unavailable", MatchKind: "lower_than_unavailable_version",
+		VersionFloorModelID: "gpt-5.5", SourceIDs: []string{"openai-cross-product-lifecycle-v2"},
+		SourceURLs: []string{"https://learn.chatgpt.com/docs/changelog"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: observed,
+	}
+	for _, tc := range []struct {
+		name         string
+		evidence     ProductModelAvailability
+		wantConflict bool
+	}{
+		{name: "authoritatively unavailable floor member", evidence: unavailable},
+		{name: "insufficient evidence remains fail closed", evidence: ProductModelAvailability{ModelID: "gpt-5.2", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"}, wantConflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := Input{
+				AccountID: s.AccountID, Source: s, CurrentMapping: map[string]string{"custom": "custom"},
+				LiveModels: []string{"custom"}, LiveListAvailable: true, Completeness: CompletenessUnknown,
+				ProductAvailabilityEnforced: true, ProductAvailability: []ProductModelAvailability{tc.evidence},
+			}
+			plan, err := Normalize(rules, input, state.Account{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(plan.Conflicts) > 0; got != tc.wantConflict {
+				t.Fatalf("conflict=%v, want %v; plan=%#v", got, tc.wantConflict, plan)
+			}
+			if !tc.wantConflict && (!plan.ApplyEligible || plan.After["custom"] != "custom") {
+				t.Fatalf("authoritative unavailable evidence should allow unrelated no-op plan: %#v", plan)
+			}
+		})
+	}
+}
+
 func TestAdditiveCatalogStillAppliesExactOwnedLifecycleExclusion(t *testing.T) {
 	source := sourceFixture()
 	rules := baseRules()
