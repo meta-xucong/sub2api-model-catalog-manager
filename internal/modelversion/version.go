@@ -62,10 +62,23 @@ func parse(modelID string) (version, bool) {
 // than floor in the same recognized model family. Equal versions and unknown
 // or cross-family identifiers never cascade.
 func LowerVersion(candidate, floor string) bool {
+	comparison, ok := compareVersion(candidate, floor)
+	return ok && comparison < 0
+}
+
+// AtOrBelowVersion reports whether candidate has an equal or lower numeric
+// version than floor in the same recognized model family. Model suffixes such
+// as fast or openai-compact do not change the numeric version.
+func AtOrBelowVersion(candidate, floor string) bool {
+	comparison, ok := compareVersion(candidate, floor)
+	return ok && comparison <= 0
+}
+
+func compareVersion(candidate, floor string) (int, bool) {
 	c, okC := parse(candidate)
 	f, okF := parse(floor)
 	if !okC || !okF || c.family != f.family {
-		return false
+		return 0, false
 	}
 	for i := 0; i < len(c.parts) || i < len(f.parts); i++ {
 		cv, fv := 0, 0
@@ -76,13 +89,13 @@ func LowerVersion(candidate, floor string) bool {
 			fv = f.parts[i]
 		}
 		if cv < fv {
-			return true
+			return -1, true
 		}
 		if cv > fv {
-			return false
+			return 1, true
 		}
 	}
-	return false
+	return 0, true
 }
 
 // HigherVersion reports whether a has a strictly higher numeric version than

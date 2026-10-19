@@ -126,6 +126,9 @@ func TestCascadeUnavailableVersionsHardRule(t *testing.T) {
 	}
 	items := []ProductModelAvailability{
 		{ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5-fast", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("1", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5-openai-compact", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("2", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.6-fast", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("3", 64)}, RetrievedAt: when},
 		{ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement", SourceIDs: floor.SourceIDs, SourceURLs: floor.SourceURLs, ContentSHA256: floor.ContentSHA256, RetrievedAt: when},
 		{ModelID: "gpt-image-1.5", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when},
 		{ModelID: "claude-opus-4-5", Provider: "anthropic", Status: "available", MatchKind: "exact", SourceIDs: []string{"anthropic-models"}, SourceURLs: []string{"https://www.anthropic.com/models"}, ContentSHA256: []string{strings.Repeat("d", 64)}, RetrievedAt: when},
@@ -139,6 +142,21 @@ func TestCascadeUnavailableVersionsHardRule(t *testing.T) {
 	}
 	if got := byID["gpt-5.4"]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
 		t.Fatalf("lower GPT version was not cascaded: %+v", got)
+	}
+	for _, id := range []string{"gpt-5.5-fast", "gpt-5.5-openai-compact"} {
+		got := byID[id]
+		if got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+			t.Fatalf("same-version GPT variant %s was not cascaded: %+v", id, got)
+		}
+		if err := validateProductModelAvailability(got); err != nil {
+			t.Fatalf("same-version cascade for %s failed validation: %v", id, err)
+		}
+	}
+	if got := byID["gpt-5.6-fast"]; got.Status != "available" {
+		t.Fatalf("higher GPT version was incorrectly cascaded: %+v", got)
+	}
+	if got := byID["gpt-5.5"]; got.MatchKind != "accepted_union_retirement" {
+		t.Fatalf("the direct unavailable trigger was overwritten by its own cascade: %+v", got)
 	}
 	if byID["gpt-image-1.5"].Status != "available" || byID["claude-opus-4-5"].Status != "available" {
 		t.Fatal("cascade crossed a model family/provider boundary")

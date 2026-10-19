@@ -170,7 +170,7 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 		participants := probeParticipants[key]
 		if len(cascadedAvailability[key]) > 0 {
 			if !hasValidatedVersionFloorProof(p, cascadedAvailability[key]) {
-				return errors.New("cascaded model-probe evidence has no matching unavailable higher-version proof")
+				return errors.New("cascaded model-probe evidence has no matching unavailable version-floor proof")
 			}
 		} else if len(participants) != len(decision.Accounts) {
 			return errors.New("approval plan model-probe account scope is incomplete")
@@ -258,7 +258,7 @@ func (p ApprovalPlan) ValidateShape(now time.Time) error {
 	for _, account := range p.Accounts {
 		for _, evidence := range account.ProductAvailability {
 			if evidence.MatchKind == "lower_than_unavailable_version" && !hasValidatedVersionFloorProof(p, []ProductModelAvailability{evidence}) {
-				return errors.New("cascaded product availability has no matching unavailable higher-version proof")
+				return errors.New("cascaded product availability has no matching unavailable version-floor proof")
 			}
 		}
 	}

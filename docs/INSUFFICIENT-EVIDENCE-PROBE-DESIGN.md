@@ -121,27 +121,32 @@ Acceptance also requires focused tests, `go test ./... -count=1`, `git diff --ch
 - That exact binary was atomically installed at `/opt/codex-usb-license-revocation/model-catalog-manager` on the Philippines jump VPS. The previous binary is preserved at `/var/backups/codex-usb-license-revocation/deploy-20261019T154402Z/model-catalog-manager` with SHA-256 `415844e8f296cde9be7fa1e5538e2a34008209bf6eb22f4253aab5aa4965206e`. The installed hash matches the local build and the license service remains active.
 - Deployment did not restart the license service, run a screening cycle, or apply mappings. This change has not yet had a post-deployment screening run. The Linux build, `gofmt`, `git diff --check`, and independent read-only audit passed; Go tests were not run for this change.
 
-## 2026-10-20 Hard lower-version retirement rule
+## 2026-10-20 Hard equal-or-lower version retirement rule
 
 The owner requires a confirmed unavailable model version to retire every
-recognized lower version in the same model family. This is a hard screening
+recognized equal-or-lower numeric version in the same model family. This is a hard screening
 rule: it applies to fresh accepted official union retirement/version-floor
 evidence, a complete configured Ark/Bailian model catalog negative, and to an
 `unavailable` result after every relevant 404token account probe failed. It
-applies across account plans, including when the higher model
-is mapped in one account and a lower version is mapped in another. A lower
-version that had positive evidence is still overridden by this rule. The
-generated approval plan records `lower_than_unavailable_version` and the exact
+applies across account plans, including when the trigger model
+is mapped in one account and an equal-or-lower version is mapped in another.
+Equal-version suffix variants (for example `gpt-5.5-fast` and
+`gpt-5.5-openai-compact`) are included; the exact direct-negative trigger
+remains the proof record. An equal-or-lower version that had positive evidence is
+still overridden by this rule. The
+generated approval plan records the legacy cascade marker
+`lower_than_unavailable_version` and the exact
 `version_floor_model_id`, and carries forward the trigger's source IDs, URLs,
 content hashes, and retrieval time. The approval-plan validator requires that
-the exact higher-version trigger also exists as a validated direct negative in
+the exact unavailable trigger also exists as a validated direct negative in
 the same all-account screening plan, either in product evidence or as an
 unavailable global probe decision. If any exact-model scope has positive
 official product evidence, failures from only the remaining probe accounts are
 ignored and do not create a global version floor.
 
-Only strictly numeric version ordering within an explicitly recognized family
-is used. GPT text IDs are separate from GPT Image; Claude Opus, Sonnet, Haiku,
+Only numeric ordering within an explicitly recognized family is used, and the
+cascade applies when the candidate is equal to or lower than the unavailable
+trigger. Strictly higher versions are retained. GPT text IDs are separate from GPT Image; Claude Opus, Sonnet, Haiku,
 and Fable are separate families. Grok, GLM, DeepSeek, Qwen, Doubao Seed,
 MiniMax M-series, and Kimi K-series (including the official bare `kN` aliases)
 are recognized independently. GPT Codex Spark is not numerically compared to
@@ -168,5 +173,8 @@ mapping Apply was run during this deployment.
 - Minimal correction: in ordinary normalization, skip the missing-family-target conflict only when product availability is enforced and the exact preferred ID is authoritatively `unavailable`. Unknown or `insufficient_evidence` status still conflicts. Regression test `TestMissingVersionFamilyTargetConflictsOnlyWithoutAuthoritativeUnavailability` covers both sides.
 - Verification passed: focused catalog regression; full `go test ./...`; `go vet ./...`; Linux amd64 build; `git diff --check`; independent read-only A1 audit. On Windows, tests must use workspace-local `GOCACHE`, `TEMP`, and `TMP` because the default sandbox temp directory denies the test suite's atomic private-file operations.
 - Commit `7f21e5a` was pushed to `origin/codex/official-selectability-auto-sync`. Linux amd64 manager SHA-256: `47f8d06c0c949d549264a84fbffc7faca716cadd072543456328e80e61443f57`. The exact binary was atomically installed on the Philippines VPS at `/opt/codex-usb-license-revocation/model-catalog-manager`; rollback copy: `/var/backups/codex-usb-license-revocation/model-catalog-manager-apply-fix-20261019T172731Z/model-catalog-manager`. Remote hash matched, ownership/mode stayed `root:root 0755`, and the license service remained active with unchanged PID `650366`.
-- Real retry completed successfully on the VPS through a transient systemd unit using the service account, admin credential, Ark/Bailian credentials, and configured cache. Run `cdbc8bd9481576a1f7e37f6d14b4c98e`, generated at `2026-10-19T17:29:23Z`: inventory 19 complete, 18 planned, 0 conflicts, 26 probe decisions, and 32 exact lower-version evidence rows with floor `gpt-5.5`. Apply completed successfully with 18 no-op accounts and zero mapping additions, updates, or removals; `consumed=false`. No lower-than-floor IDs existed as exact mapping targets in the 18 planned accounts, so no mapping deletion was required. The 2 unresolved model names remain unmodified. Exact account mappings `gpt-5.5-fast` and `gpt-5.5-openai-compact` also remain because their probe status was `account_probe_ignored`; the current cascade is strict numeric `< 5.5`, so same-version suffixed IDs are outside that rule.
 - Summary: `/var/lib/codex-usb-license-revocation/model-catalog/reports/screen-summary-20261019T172923Z-cdbc8bd9481576a1f7e37f6d14b4c98e.md`; plan: `/var/lib/codex-usb-license-revocation/model-catalog/reports/plan-20261019T173744Z-68978b83cd07b08240476954da98110d.json`. The retry used the manager CLI directly, so the license web runner's separate `run-state.json` still displays the prior failed click; it must not be treated as this retry's result. The CLI summary and plan are the verified terminal evidence for this run.
+
+## 2026-10-20 Equal-version cascade correction
+
+The follow-up real run exposed the missing boundary: the previous cascade used strict `<`, so same-version suffix models such as `gpt-5.5-fast` and `gpt-5.5-openai-compact` survived when their `gpt-5.5` trigger was unavailable. The comparison now cascades same-family IDs with numeric versions `<=` the validated unavailable trigger; the exact trigger remains as direct evidence and strictly higher versions are retained. Focused regressions cover both named GPT variants through the probe-cascade function, lower/higher versions, and evidence validation. Deployment and live Apply status will be added after those gates complete.

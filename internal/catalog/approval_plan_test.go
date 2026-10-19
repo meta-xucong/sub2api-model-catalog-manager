@@ -47,7 +47,7 @@ func TestModelProbeDigestValidatesAggregateAndAccountOrder(t *testing.T) {
 func TestCascadedEvidenceRequiresMatchingUnavailableFloor(t *testing.T) {
 	when := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	trigger := ProductModelAvailability{ModelID: "gpt-5.5", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_retirement", SourceIDs: []string{"openai-cross-product-lifecycle-v2"}, SourceURLs: []string{"https://learn.chatgpt.com/docs/changelog"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when}
-	cascaded := ProductModelAvailability{ModelID: "gpt-5.4", Provider: "openai", Status: "unavailable", MatchKind: "lower_than_unavailable_version", VersionFloorModelID: "gpt-5.5", SourceIDs: append([]string(nil), trigger.SourceIDs...), SourceURLs: append([]string(nil), trigger.SourceURLs...), ContentSHA256: append([]string(nil), trigger.ContentSHA256...), RetrievedAt: when}
+	cascaded := ProductModelAvailability{ModelID: "gpt-5.5-fast", Provider: "openai", Status: "unavailable", MatchKind: "lower_than_unavailable_version", VersionFloorModelID: "gpt-5.5", SourceIDs: append([]string(nil), trigger.SourceIDs...), SourceURLs: append([]string(nil), trigger.SourceURLs...), ContentSHA256: append([]string(nil), trigger.ContentSHA256...), RetrievedAt: when}
 	if !hasValidatedVersionFloorProof(ApprovalPlan{Accounts: []Plan{{ProductAvailability: []ProductModelAvailability{trigger, cascaded}}}}, []ProductModelAvailability{cascaded}) {
 		t.Fatal("cascaded evidence with a matching unavailable trigger was rejected")
 	}
@@ -117,7 +117,7 @@ func TestCascadeOverridesLowerModelProbeDecisionWithoutParticipantEvidence(t *te
 		}},
 	}
 	if err := plan.ValidateShape(now); err != nil {
-		t.Fatalf("valid higher-version failure cascade should pass full approval validation: %v", err)
+		t.Fatalf("valid equal-version failure cascade should pass full approval validation: %v", err)
 	}
 	badTrigger := trigger
 	badTrigger.ContentSHA256 = []string{strings.Repeat("f", 64)}

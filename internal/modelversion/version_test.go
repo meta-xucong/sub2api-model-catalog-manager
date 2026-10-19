@@ -32,3 +32,16 @@ func TestLowerVersionSameFamilyOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestAtOrBelowVersionIncludesEqualSuffixVariants(t *testing.T) {
+	for _, candidate := range []string{"gpt-5.5", "gpt-5.5-fast", "gpt-5.5-openai-compact", "gpt-5.4"} {
+		if !AtOrBelowVersion(candidate, "gpt-5.5") {
+			t.Errorf("AtOrBelowVersion(%q, gpt-5.5)=false", candidate)
+		}
+	}
+	for _, candidate := range []string{"gpt-5.6", "gpt-image-2.5", "claude-opus-4-6"} {
+		if AtOrBelowVersion(candidate, "gpt-5.5") {
+			t.Errorf("AtOrBelowVersion(%q, gpt-5.5)=true", candidate)
+		}
+	}
+}

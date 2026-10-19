@@ -2075,18 +2075,36 @@ func TestResolveInsufficientEvidenceRequiresEveryRelevantAccountToFail(t *testin
 	}
 }
 
-func TestUnavailableProbeCascadesToLowerMappedVersion(t *testing.T) {
+func TestUnavailableProbeCascadesToEqualOrLowerMappedVersions(t *testing.T) {
 	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
 	plan := catalog.Plan{ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{
 		{ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when},
 		{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"},
+		{ModelID: "gpt-5.5-fast", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5-openai-compact", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.6-fast", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("d", 64)}, RetrievedAt: when},
 	}}
 	decision := catalog.ModelProbeDecision{Provider: "openai", ModelID: "gpt-5.5", Status: "unavailable", Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}}}
 	if err := applyModelProbeEvidence(&plan, decision, when); err != nil {
 		t.Fatalf("failed probe did not cascade: %v", err)
 	}
-	if got := plan.ProductAvailability[0]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+	availability := make(map[string]catalog.ProductModelAvailability, len(plan.ProductAvailability))
+	for _, item := range plan.ProductAvailability {
+		availability[item.ModelID] = item
+	}
+	if got := availability["gpt-5.4"]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
 		t.Fatalf("lower GPT version was not marked unavailable: %+v", got)
+	}
+	for _, id := range []string{"gpt-5.5-fast", "gpt-5.5-openai-compact"} {
+		if got := availability[id]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+			t.Fatalf("equal-version GPT variant %s was not marked unavailable: %+v", id, got)
+		}
+	}
+	if got := availability["gpt-5.5"]; got.Status != "unavailable" || got.MatchKind != "all_account_probes_failed" {
+		t.Fatalf("the direct unavailable trigger was not preserved as evidence: %+v", got)
+	}
+	if got := availability["gpt-5.6-fast"]; got.Status != "available" {
+		t.Fatalf("strictly higher GPT version was incorrectly marked unavailable: %+v", got)
 	}
 	if _, err := catalog.ProductAvailabilityDigest(plan.ProductAvailability); err != nil {
 		t.Fatalf("cascaded evidence is not digestible/valid: %v", err)

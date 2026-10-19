@@ -8,8 +8,8 @@ import (
 )
 
 // CascadeUnavailableVersions applies the owner hard rule to exact model IDs:
-// once an authoritative negative proves a version unavailable, lower versions
-// in the same recognized family are unavailable too. Unknown IDs, other
+// once an authoritative negative proves a version unavailable, equal-or-lower
+// numeric versions in the same recognized family are unavailable too. Unknown IDs, other
 // families, and non-authoritative/incomplete evidence are left unchanged.
 func CascadeUnavailableVersions(items []ProductModelAvailability) {
 	floors := make(map[string]ProductModelAvailability)
@@ -31,12 +31,12 @@ func CascadeUnavailableVersions(items []ProductModelAvailability) {
 			continue
 		}
 		floor, ok := floors[item.Provider+"\x00"+family]
-		if !ok || !modelversion.LowerVersion(item.ModelID, floor.ModelID) {
+		if !ok || item.ModelID == floor.ModelID || !modelversion.AtOrBelowVersion(item.ModelID, floor.ModelID) {
 			continue
 		}
-		// The owner hard rule takes precedence over a lower ID's direct negative
+		// The owner hard rule takes precedence over an equal/lower ID's direct negative
 		// classification too. Reclassifying it as a cascade is necessary because
-		// this rule explicitly authorizes removing unmanaged lower-version mappings.
+		// this rule explicitly authorizes removing unmanaged equal/lower mappings.
 		item.Status = "unavailable"
 		item.MatchKind = "lower_than_unavailable_version"
 		item.VersionFloorModelID = floor.ModelID

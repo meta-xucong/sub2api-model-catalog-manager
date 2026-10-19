@@ -1241,8 +1241,8 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 		}
 	}
 	if item.MatchKind == "lower_than_unavailable_version" {
-		if item.VersionFloorModelID == "" || !modelversion.LowerVersion(item.ModelID, item.VersionFloorModelID) || !validVersionFloorSource(item) {
-			return errors.New("cascaded version-floor evidence does not identify a newer unavailable model in the same family")
+		if item.VersionFloorModelID == "" || item.ModelID == item.VersionFloorModelID || !modelversion.AtOrBelowVersion(item.ModelID, item.VersionFloorModelID) || !validVersionFloorSource(item) {
+			return errors.New("cascaded version-floor evidence does not identify an equal-or-lower model relative to its unavailable trigger")
 		}
 	} else if item.VersionFloorModelID != "" {
 		return errors.New("version-floor trigger is only valid for cascaded unavailability")

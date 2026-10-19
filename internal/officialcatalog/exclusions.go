@@ -253,7 +253,7 @@ func EvaluateProductAvailability(syncResult StartupSyncResult, modelIDs []string
 	ids := uniqueProductModelIDs(modelIDs)
 	// Include exact accepted-union retirement subjects even if the candidate
 	// inventory no longer contains the higher ID. Their negative evidence is
-	// the version-floor proof for lower mapped IDs in this same provider family.
+	// the version-floor proof for equal-or-lower mapped IDs in this provider family.
 	for _, retirement := range acceptedUnionRetirements(syncResult, "openai", now) {
 		if productRetiredNow(retirement, now) {
 			ids = append(ids, retirement.ModelID)
@@ -390,10 +390,10 @@ func applyProductVersionFloor(items []ProductModelAvailability) {
 			continue
 		}
 		floor, ok := floors[item.Provider+"\x00"+family]
-		if !ok || !modelversion.LowerVersion(item.ModelID, floor.ModelID) {
+		if !ok || item.ModelID == floor.ModelID || !modelversion.AtOrBelowVersion(item.ModelID, floor.ModelID) {
 			continue
 		}
-		// Preserve the hard cascade marker even when this lower ID also has
+		// Preserve the hard cascade marker even when this equal/lower ID also has
 		// direct absence evidence: only the cascade marker authorizes removal of
 		// unmanaged mappings under the owner rule.
 		item.Status = "unavailable"
