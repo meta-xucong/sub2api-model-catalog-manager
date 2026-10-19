@@ -56,31 +56,43 @@ type Mapping struct {
 }
 
 type DiscoveryAccount struct {
-	ID                     int64                        `json:"account_id"`
-	CurrentMappingStatus   string                       `json:"current_mapping_status,omitempty"`
-	CurrentMappings        []Mapping                    `json:"current_model_mappings,omitempty"`
-	NativeRefreshProfile   string                       `json:"native_refresh_source_profile_id,omitempty"`
-	NativeRefreshStatus    string                       `json:"native_refresh_account_status,omitempty"`
-	SourceFingerprint      string                       `json:"source_fingerprint,omitempty"`
-	SourceProfileStatus    string                       `json:"source_profile_status"`
-	IdentityAddPolicy      string                       `json:"identity_add_policy,omitempty"`
-	IdentityCatalogPolicy  string                       `json:"identity_catalog_policy,omitempty"`
-	LifecycleScopes        []string                     `json:"lifecycle_scopes,omitempty"`
-	LifecycleScopeStatus   string                       `json:"lifecycle_scope_status,omitempty"`
-	LifecycleBlockedScopes []string                     `json:"lifecycle_blocked_scopes,omitempty"`
-	LifecycleExclusions    []catalog.LifecycleExclusion `json:"lifecycle_exclusions,omitempty"`
-	Status                 string                       `json:"status"`
-	Reason                 string                       `json:"reason,omitempty"`
-	CatalogHash            string                       `json:"catalog_hash,omitempty"`
-	CatalogObservedAt      *time.Time                   `json:"catalog_observed_at,omitempty"`
-	CatalogCompleteness    string                       `json:"catalog_completeness"`
-	LiveListAvailable      bool                         `json:"live_list_available"`
-	Warnings               []string                     `json:"warning_codes,omitempty"`
-	Models                 []string                     `json:"models,omitempty"`
-	Changes                []MappingChange              `json:"proposed_changes,omitempty"`
-	Conflicts              []string                     `json:"conflicts,omitempty"`
-	UnreviewedModels       []string                     `json:"unreviewed_models,omitempty"`
-	CatalogDiagnostics     *CatalogDiagnostics          `json:"catalog_diagnostics,omitempty"`
+	ID                     int64                         `json:"account_id"`
+	CurrentMappingStatus   string                        `json:"current_mapping_status,omitempty"`
+	CurrentMappings        []Mapping                     `json:"current_model_mappings,omitempty"`
+	NativeRefreshProfile   string                        `json:"native_refresh_source_profile_id,omitempty"`
+	NativeRefreshStatus    string                        `json:"native_refresh_account_status,omitempty"`
+	SourceFingerprint      string                        `json:"source_fingerprint,omitempty"`
+	SourceProfileStatus    string                        `json:"source_profile_status"`
+	IdentityAddPolicy      string                        `json:"identity_add_policy,omitempty"`
+	IdentityCatalogPolicy  string                        `json:"identity_catalog_policy,omitempty"`
+	LifecycleScopes        []string                      `json:"lifecycle_scopes,omitempty"`
+	LifecycleScopeStatus   string                        `json:"lifecycle_scope_status,omitempty"`
+	LifecycleBlockedScopes []string                      `json:"lifecycle_blocked_scopes,omitempty"`
+	LifecycleExclusions    []catalog.LifecycleExclusion  `json:"lifecycle_exclusions,omitempty"`
+	Status                 string                        `json:"status"`
+	Reason                 string                        `json:"reason,omitempty"`
+	CatalogHash            string                        `json:"catalog_hash,omitempty"`
+	CatalogObservedAt      *time.Time                    `json:"catalog_observed_at,omitempty"`
+	CatalogCompleteness    string                        `json:"catalog_completeness"`
+	LiveListAvailable      bool                          `json:"live_list_available"`
+	Warnings               []string                      `json:"warning_codes,omitempty"`
+	Models                 []string                      `json:"models,omitempty"`
+	ProductAvailability    []ProductAvailabilityEvidence `json:"product_availability,omitempty"`
+	Changes                []MappingChange               `json:"proposed_changes,omitempty"`
+	Conflicts              []string                      `json:"conflicts,omitempty"`
+	UnreviewedModels       []string                      `json:"unreviewed_models,omitempty"`
+	CatalogDiagnostics     *CatalogDiagnostics           `json:"catalog_diagnostics,omitempty"`
+}
+
+// ProductAvailabilityEvidence carries the exact, post-screening status for a
+// model ID into the report-only name review. It intentionally omits source
+// URLs, response hashes, and credentials; the approved plan retains full
+// provenance separately.
+type ProductAvailabilityEvidence struct {
+	ModelID   string `json:"model_id"`
+	Provider  string `json:"provider,omitempty"`
+	Status    string `json:"status"`
+	MatchKind string `json:"match_kind"`
 }
 
 // CatalogDiagnostics is a read-only comparison of account mapping IDs, the
@@ -142,6 +154,12 @@ func (d *Document) Sort() {
 	for i := range d.Discovery {
 		sort.Slice(d.Discovery[i].CurrentMappings, func(a, b int) bool {
 			return d.Discovery[i].CurrentMappings[a].PublicID < d.Discovery[i].CurrentMappings[b].PublicID
+		})
+		sort.Slice(d.Discovery[i].ProductAvailability, func(a, b int) bool {
+			if d.Discovery[i].ProductAvailability[a].ModelID != d.Discovery[i].ProductAvailability[b].ModelID {
+				return d.Discovery[i].ProductAvailability[a].ModelID < d.Discovery[i].ProductAvailability[b].ModelID
+			}
+			return d.Discovery[i].ProductAvailability[a].Provider < d.Discovery[i].ProductAvailability[b].Provider
 		})
 	}
 }

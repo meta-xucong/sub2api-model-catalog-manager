@@ -854,6 +854,7 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 			plan.DiscoveryReason = "catalog response contains warnings that may affect the model-ID list"
 		}
 		baseRow.Changes = make([]report.MappingChange, 0, len(plan.Changes))
+		baseRow.ProductAvailability = reportAvailability(plan.ProductAvailability)
 		for _, change := range plan.Changes {
 			baseRow.Changes = append(baseRow.Changes, report.MappingChange{Action: change.Action, PublicID: change.PublicID, Before: change.Before, After: change.After, RuleKind: change.RuleKind, Evidence: change.Evidence, Reason: change.Reason})
 		}
@@ -945,6 +946,7 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 					for _, c := range verified.Changes {
 						doc.Discovery[rowIndex].Changes = append(doc.Discovery[rowIndex].Changes, report.MappingChange{Action: c.Action, PublicID: c.PublicID, Before: c.Before, After: c.After, RuleKind: c.RuleKind, Evidence: c.Evidence, Reason: c.Reason})
 					}
+					doc.Discovery[rowIndex].ProductAvailability = reportAvailability(verified.ProductAvailability)
 					doc.Discovery[rowIndex].Conflicts = append([]string{}, verified.Conflicts...)
 					doc.Discovery[rowIndex].UnreviewedModels = append([]string{}, verified.UnreviewedModels...)
 					break
@@ -981,6 +983,20 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 	doc.Sort()
 	result.Report = doc
 	return result, nil
+}
+
+func reportAvailability(items []catalog.ProductModelAvailability) []report.ProductAvailabilityEvidence {
+	out := make([]report.ProductAvailabilityEvidence, 0, len(items))
+	for _, item := range items {
+		out = append(out, report.ProductAvailabilityEvidence{ModelID: item.ModelID, Provider: item.Provider, Status: item.Status, MatchKind: item.MatchKind})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ModelID != out[j].ModelID {
+			return out[i].ModelID < out[j].ModelID
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	return out
 }
 
 // ownerOnlyNormalizationRules prevents unrelated alias, family, retirement,

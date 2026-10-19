@@ -64,6 +64,181 @@ func TestBuildDoesNotGroupWithoutExactPrefixOrValidDate(t *testing.T) {
 	}
 }
 
+func TestBuildCreatesConservativeNameRecommendationsOnlyForAvailableExactIDs(t *testing.T) {
+	inspect, discover, _ := reviewFixture(t)
+	discover.Discovery[0].Models = []string{"GPT_5.6", "gpt-5.6", "gpt-5.6-fast", "gpt-5.6-compact", "opaque/variant", "unlisted"}
+	discover.Discovery[0].ProductAvailability = []ProductAvailabilityEvidence{
+		{ModelID: "GPT_5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "gpt-5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "gpt-5.6-fast", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "gpt-5.6-compact", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "opaque/variant", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "unlisted", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"},
+	}
+	out, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("1", 64), state.Empty(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := out.Accounts[0]
+	if len(row.NameMergeCandidates) != 1 {
+		t.Fatalf("expected one conservative punctuation/case candidate, got %#v", row.NameMergeCandidates)
+	}
+	candidate := row.NameMergeCandidates[0]
+	if candidate.NormalizedKey != "gpt-5.6" || candidate.Action != "none" || candidate.Equivalence != "unproven" || !candidate.DecisionRequired || len(candidate.Members) != 2 {
+		t.Fatalf("candidate overstates merge certainty or changed exact members: %#v", candidate)
+	}
+	if len(row.NameMergeSkips) != 2 || row.NameMergeSkips[0].ModelID != "opaque/variant" || row.NameMergeSkips[1].Reason != "exact_model_screening_insufficient_evidence" {
+		t.Fatalf("missing explicit skip reasons: %#v", row.NameMergeSkips)
+	}
+}
+
+func TestBuildDateCandidatesRequireEachExactMemberAvailable(t *testing.T) {
+	inspect, discover, _ := reviewFixture(t)
+	discover.Discovery[0].ProductAvailability[1].Status = "unavailable"
+	discover.Discovery[0].ProductAvailability[2].Status = "unavailable"
+	out, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("2", 64), state.Empty(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Summary.DateFamilyCandidates != 0 || len(out.Accounts[0].NameMergeSkips) == 0 {
+		t.Fatalf("date candidate was formed without every exact member being available: %#v", out.Accounts[0])
+	}
+}
+
+func TestBuildRejectsDuplicateAvailabilityEvidence(t *testing.T) {
+	inspect, discover, _ := reviewFixture(t)
+	discover.Discovery[0].ProductAvailability = append(discover.Discovery[0].ProductAvailability, discover.Discovery[0].ProductAvailability[0])
+	if _, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("3", 64), state.Empty(), time.Now()); err == nil {
+		t.Fatal("duplicate exact availability evidence was accepted")
+	}
+}
+
+func TestMergeCandidatesRequireApprovedOfficialMatchKinds(t *testing.T) {
+	inspect, discover, _ := reviewFixture(t)
+	discover.Discovery[0].Models = []string{
+		"gpt_5.6", "gpt-5.6",
+		"grok_4.5", "grok-4.5",
+		"gpt_5.7", "gpt-5.7",
+	}
+	discover.Discovery[0].ProductAvailability = []ProductAvailabilityEvidence{
+		{ModelID: "gpt_5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "gpt-5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "grok_4.5", Provider: "xai", Status: "available", MatchKind: "explicit_alias"},
+		{ModelID: "grok-4.5", Provider: "xai", Status: "available", MatchKind: "explicit_alias"},
+		{ModelID: "gpt_5.7", Provider: "openai", Status: "available", MatchKind: "account_probe_success"},
+		{ModelID: "gpt-5.7", Provider: "openai", Status: "available", MatchKind: "account_probe_success"},
+	}
+	out, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("5", 64), state.Empty(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := out.Accounts[0]
+	if len(row.NameMergeCandidates) != 2 || row.NameMergeCandidates[0].NormalizedKey != "gpt-5.6" || row.NameMergeCandidates[1].NormalizedKey != "grok-4.5" {
+		t.Fatalf("exact and explicit-alias official evidence should qualify, probe-only evidence should not: %#v", row.NameMergeCandidates)
+	}
+	if len(row.NameMergeSkips) != 2 || row.NameMergeSkips[0].Reason != "account_probe_success_is_not_official_product_evidence" || row.NameMergeSkips[1].Reason != "account_probe_success_is_not_official_product_evidence" {
+		t.Fatalf("probe-only IDs lack a clear official-evidence skip reason: %#v", row.NameMergeSkips)
+	}
+}
+
+func TestBuildRejectsAvailabilityWithoutProvider(t *testing.T) {
+	inspect, discover, _ := reviewFixture(t)
+	discover.Discovery[0].ProductAvailability[0].Provider = ""
+	if _, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("6", 64), state.Empty(), time.Now()); err == nil {
+		t.Fatal("availability evidence without a provider was accepted")
+	}
+}
+
+func TestProbeEvidenceWithoutProviderIsReportedAsSkip(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, kind, skipReason string
+	}{
+		{name: "success", status: "available", kind: "account_probe_success", skipReason: "account_probe_success_is_not_official_product_evidence"},
+		{name: "all_failed", status: "unavailable", kind: "all_account_probes_failed", skipReason: "exact_model_screened_unavailable"},
+		{name: "ignored", status: "insufficient_evidence", kind: "account_probe_ignored", skipReason: "exact_model_screening_insufficient_evidence"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inspect, discover, _ := reviewFixture(t)
+			discover.Discovery[0].Models = []string{"probe-only", "GPT_5.6", "gpt-5.6"}
+			discover.Discovery[0].ProductAvailability = []ProductAvailabilityEvidence{
+				{ModelID: "probe-only", Status: tc.status, MatchKind: tc.kind},
+				{ModelID: "GPT_5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+				{ModelID: "gpt-5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+			}
+			out, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("7", 64), state.Empty(), time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := out.Accounts[0]
+			if len(row.NameMergeCandidates) != 1 || len(row.NameMergeSkips) != 1 {
+				t.Fatalf("official records should still form the candidate while providerless probe evidence is filtered: %#v", row)
+			}
+			if row.NameMergeCandidates[0].NormalizedKey != "gpt-5.6" || row.NameMergeCandidates[0].Action != "none" || row.NameMergeSkips[0].Reason != tc.skipReason {
+				t.Fatalf("probe-only ID entered or changed a name candidate: %#v", row)
+			}
+		})
+	}
+}
+
+func TestProbeEvidenceWithoutProviderRequiresMatchingStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		kind   string
+	}{
+		{status: "unavailable", kind: "account_probe_success"},
+		{status: "available", kind: "all_account_probes_failed"},
+		{status: "available", kind: "account_probe_ignored"},
+	} {
+		t.Run(tc.status+"/"+tc.kind, func(t *testing.T) {
+			inspect, discover, _ := reviewFixture(t)
+			discover.Discovery[0].ProductAvailability[0] = ProductAvailabilityEvidence{ModelID: "gpt-5.6", Status: tc.status, MatchKind: tc.kind}
+			if _, err := Build(inspect, discover, catalog.Rules{SchemaVersion: 1}, strings.Repeat("8", 64), state.Empty(), time.Now()); err == nil {
+				t.Fatal("providerless probe evidence with mismatched status was accepted")
+			}
+		})
+	}
+}
+
+func TestNameMergeCandidateReportsPartialRuleConflictAndMappingOwnership(t *testing.T) {
+	inspect, discover, source := reviewFixture(t)
+	inspect.Accounts[0].Mappings = append(inspect.Accounts[0].Mappings,
+		Mapping{PublicID: "GPT_5.6", UpstreamID: "GPT_5.6"},
+		Mapping{PublicID: "gpt-5.6", UpstreamID: "gpt-5.6"},
+	)
+	values := map[string]string{}
+	for _, mapping := range inspect.Accounts[0].Mappings {
+		values[mapping.PublicID] = mapping.UpstreamID
+	}
+	var err error
+	inspect.Accounts[0].MappingSHA256, err = catalog.MappingHash(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discover.Discovery[0].Models = []string{"GPT_5.6", "gpt-5.6"}
+	discover.Discovery[0].ProductAvailability = []ProductAvailabilityEvidence{
+		{ModelID: "GPT_5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+		{ModelID: "gpt-5.6", Provider: "openai", Status: "available", MatchKind: "exact"},
+	}
+	rules := catalog.Rules{SchemaVersion: 1, Aliases: []catalog.AliasRule{{
+		Source: source, UpstreamID: "GPT_5.6", PublicID: "public-gpt", Decision: "approved", Evidence: "reviewed", ReviewedAt: "2026-10-20",
+	}}}
+	local := state.Empty()
+	local.Accounts["9001"] = state.Account{ManagedMappings: map[string]state.ManagedMapping{
+		"GPT_5.6": {LastAppliedValue: "GPT_5.6", SourceFingerprint: inspect.Accounts[0].SourceFingerprint},
+	}}
+	out, err := Build(inspect, discover, rules, strings.Repeat("4", 64), local, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := out.Accounts[0].NameMergeCandidates[0]
+	if !candidate.RuleConflict || candidate.SkipReason != "explicit_rules_conflict_with_candidate" || candidate.MatchingAliasRules != 1 {
+		t.Fatalf("partial explicit alias rule was not exposed as a conflict: %#v", candidate)
+	}
+	if len(candidate.RelatedMappings) != 2 || candidate.RelatedMappings[0].Ownership != "managed" || candidate.RelatedMappings[1].Ownership != "unmanaged" {
+		t.Fatalf("candidate mapping ownership was not reported exactly: %#v", candidate.RelatedMappings)
+	}
+}
+
 func TestBuildRejectsMismatchedOrPartialReports(t *testing.T) {
 	inspect, discover, _ := reviewFixture(t)
 	discover.AccountInventorySHA256 = strings.Repeat("f", 64)
@@ -211,7 +386,12 @@ func reviewFixture(t *testing.T) (InputReport, InputReport, catalog.Source) {
 		AccountInventoryCount: 1, AccountInventorySHA256: idsHash, TargetFingerprint: "build-test",
 		Discovery: []DiscoveryAccount{{
 			ID: 9001, SourceFingerprint: fingerprint, Status: "candidate_reported", LiveListAvailable: true,
-			Models:  []string{"deepseek-v4-flash", "deepseek-v4-flash-20261001", "deepseek-v4-flash-20261002"},
+			Models: []string{"deepseek-v4-flash", "deepseek-v4-flash-20261001", "deepseek-v4-flash-20261002"},
+			ProductAvailability: []ProductAvailabilityEvidence{
+				{ModelID: "deepseek-v4-flash", Provider: "deepseek", Status: "available", MatchKind: "exact"},
+				{ModelID: "deepseek-v4-flash-20261001", Provider: "deepseek", Status: "available", MatchKind: "exact"},
+				{ModelID: "deepseek-v4-flash-20261002", Provider: "deepseek", Status: "available", MatchKind: "exact"},
+			},
 			Changes: []MappingChange{{Action: "remove", PublicID: "deepseek-v4-flash-20261001", RuleKind: "version_family"}},
 		}},
 	}
