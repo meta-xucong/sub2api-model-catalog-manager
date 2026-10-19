@@ -515,7 +515,7 @@ func fetchAndParsePage(ctx context.Context, spec sourceSpec, rawURL string, prio
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
 			cancel()
-			return CachedPage{}, fetchFailure{code: "http_error"}
+			return CachedPage{}, fetchFailure{code: fmt.Sprintf("http_status_%d", resp.StatusCode)}
 		}
 		limit := spec.maxBody
 		if rawURL != spec.rootURL {

@@ -1419,6 +1419,22 @@ func TestAlibabaRendererUsesAnonymousOriginRequest(t *testing.T) {
 	}
 }
 
+func TestFetchPreservesHTTPStatusCodeInFailure(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			spec := specFor(t, "openai")
+			doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
+				return jsonResponse(status, "blocked"), nil
+			}}
+			_, err := fetchAndParsePage(context.Background(), spec, spec.rootURL, CachedPage{}, false, doer, &requestBudget{}, time.Now)
+			want := fmt.Sprintf("http_status_%d", status)
+			if got := failureCode(err); got != want {
+				t.Fatalf("failure code=%q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestAlibabaRendererBusinessAndSchemaFailuresRetainLastGood(t *testing.T) {
 	spec := specFor(t, "alibaba")
 	url := alibabaBulletinURL("123456")
