@@ -37,7 +37,7 @@ mapping:
 
 | Product surface | Official source | Coverage |
 | --- | --- | --- |
-| ChatGPT signed-in web | [GPT-6 and other models in ChatGPT](https://help.openai.com/en/articles/20001354-gpt-6-and-other-models-in-chatgpt); [GPT-6 for everyone](https://openai.com/index/gpt-6-for-everyone/) | The Help page lists GPT-6 and GPT-5.6 by product/plan but is currently HTTP 403 from the local runtime. The public OpenAI product announcement independently supplies positive GPT-6 evidence for ChatGPT and is parsed only for the exact `gpt-6` family. Neither source is a complete selector inventory; absence cannot delete a mapping. |
+| ChatGPT signed-in web | [GPT-6 and other models in ChatGPT](https://help.openai.com/en/articles/20001354-gpt-6-and-other-models-in-chatgpt); [GPT-6 for everyone](https://openai.com/index/gpt-6-for-everyone/) | The Help page lists GPT-6 and GPT-5.6 by product/plan but is currently HTTP 403 from the Philippines VPS. The response is a Cloudflare challenge (`cf-mitigated: challenge`); both curl's default User-Agent and the manager's User-Agent receive it with successful TLS. The public OpenAI product announcement independently supplies positive GPT-6 evidence for ChatGPT when reachable and is parsed only for the exact `gpt-6` family. Neither source is a complete selector inventory; absence cannot delete a mapping. |
 | OpenAI Codex with ChatGPT sign-in | [Codex models](https://developers.openai.com/codex/models) | Codex model names and Codex-scoped lifecycle notes; not a complete ChatGPT web catalog |
 | OpenAI cross-product lifecycle | [ChatGPT & Codex changelog](https://learn.chatgpt.com/docs/changelog) | A retirement becomes accepted-union negative evidence only when one official Codex changelog entry explicitly says the exact GPT model retires from both ChatGPT web/Work and Codex. A Codex-only statement, including “Codex with ChatGPT sign-in,” does not establish that the ChatGPT web product retired the model. |
 | Claude consumer web | [Paid Claude plan context window](https://support.claude.com/en/articles/8606394-how-large-is-the-context-window-on-paid-claude-plans) | Names under “Chatting with Claude”; a display name maps only when it has an exact crosswalk in the [Claude Code model configuration](https://support.claude.com/en/articles/11940350-claude-code-model-configuration) |
@@ -95,6 +95,18 @@ are excluded from positive product eligibility and cannot override a product
 source's scope or completeness. The OpenAI, Claude, and Kimi model-name
 crosswalks are intentionally narrow and covered by focused parser tests; no
 suffix or version-family rule is used to manufacture an ID.
+
+## HTTP rate-limit retries
+
+Official-source GETs retry HTTP 429 at most three times after the initial
+request, with exponential delays of 1, 2, and 4 seconds. A valid `Retry-After`
+value overrides that delay up to an 8-second maximum; a longer server-requested
+wait is not retried early. Retries count against the shared startup GET budget
+and stop when the sync context is cancelled; cancellation is reported separately
+from an exhausted 429 retry. If `Retry-After` exceeds 8 seconds, the source is
+not retried during that fetch rather than retrying before the server's requested
+time. Exhaustion preserves the 429 failure and last-good snapshot as stale diagnostic context only; it cannot
+establish model availability, absence, retirement, or version-floor evidence.
 
 ## Volcengine Ark account inventory
 

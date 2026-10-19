@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,66 @@ func TestFetchAlibabaModelStudioCatalogPaginatesAndValidatesEndpoint(t *testing.
 	}
 	if err := validateSnapshot(spec, snapshot); err != nil {
 		t.Fatalf("complete Model Studio snapshot did not validate: %v", err)
+	}
+}
+
+func TestFetchAlibabaModelStudioRetries429WithExponentialBackoff(t *testing.T) {
+	spec, ok := sourceForID("alibaba-model-studio-models")
+	if !ok {
+		t.Fatal("Model Studio source is missing from the manifest")
+	}
+	const apiKey = "sk-ws-unit-secret"
+	now := time.Date(2026, 10, 18, 5, 0, 0, 0, time.UTC)
+	attempts := 0
+	var delays []time.Duration
+	doer := modelStudioDoerFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		if request.Header.Get("Authorization") != "Bearer "+apiKey {
+			t.Fatal("Model Studio retry changed or omitted its authorization")
+		}
+		if attempts < 3 {
+			response := modelStudioResponse("rate limited")
+			response.StatusCode = http.StatusTooManyRequests
+			return response, nil
+		}
+		return modelStudioResponse(modelStudioPayload(1, 1, 200, "qwen3.8-max")), nil
+	})
+	budget := &requestBudget{sleep: func(ctx context.Context, delay time.Duration) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		delays = append(delays, delay)
+		return true
+	}}
+	snapshot, err := fetchAlibabaModelStudioCatalog(context.Background(), spec, apiKey, doer, budget, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("Model Studio fetch failed after 429 recovery: %v", err)
+	}
+	if attempts != 3 || budget.count() != 3 || !snapshot.Complete || len(snapshot.Pages) != 1 || len(snapshot.Pages[0].AvailableModelIDs) != 1 {
+		t.Fatalf("Model Studio retry did not produce a complete snapshot: attempts=%d budget=%d snapshot=%+v", attempts, budget.count(), snapshot)
+	}
+	if !reflect.DeepEqual(delays, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("backoff delays=%v, want [1s 2s]", delays)
+	}
+}
+
+func TestFetchAlibabaModelStudioRetries429WithNilBody(t *testing.T) {
+	spec, _ := sourceForID("alibaba-model-studio-models")
+	const apiKey = "sk-ws-unit-secret"
+	attempts := 0
+	doer := modelStudioDoerFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}, nil
+		}
+		return modelStudioResponse(modelStudioPayload(1, 1, 200, "qwen3.8-max")), nil
+	})
+	budget := &requestBudget{sleep: func(context.Context, time.Duration) bool { return true }}
+	if _, err := fetchAlibabaModelStudioCatalog(context.Background(), spec, apiKey, doer, budget, time.Now); err != nil {
+		t.Fatalf("nil-body 429 prevented Model Studio recovery: %v", err)
+	}
+	if attempts != 2 || budget.count() != 2 {
+		t.Fatalf("nil-body 429 retry attempts=%d budget=%d, want 2", attempts, budget.count())
 	}
 }
 

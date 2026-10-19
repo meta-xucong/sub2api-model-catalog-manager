@@ -1420,7 +1420,7 @@ func TestAlibabaRendererUsesAnonymousOriginRequest(t *testing.T) {
 }
 
 func TestFetchPreservesHTTPStatusCodeInFailure(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+	for _, status := range []int{http.StatusForbidden, http.StatusServiceUnavailable} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			spec := specFor(t, "openai")
 			doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
@@ -1430,6 +1430,119 @@ func TestFetchPreservesHTTPStatusCodeInFailure(t *testing.T) {
 			want := fmt.Sprintf("http_status_%d", status)
 			if got := failureCode(err); got != want {
 				t.Fatalf("failure code=%q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestFetchRetriesRateLimitedPageWithExponentialBackoff(t *testing.T) {
+	spec := specFor(t, "openai")
+	attempts := 0
+	var delays []time.Duration
+	doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts < 3 {
+			return htmlResponse(http.StatusTooManyRequests, "rate limited"), nil
+		}
+		return htmlResponse(http.StatusOK, string(fixture(t, "openai-deprecations.html"))), nil
+	}}
+	budget := &requestBudget{sleep: func(ctx context.Context, delay time.Duration) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		delays = append(delays, delay)
+		return true
+	}}
+	page, err := fetchAndParsePage(context.Background(), spec, spec.rootURL, CachedPage{}, false, doer, budget, time.Now)
+	if err != nil {
+		t.Fatalf("page fetch after rate-limit recovery failed: %v", err)
+	}
+	if attempts != 3 || budget.count() != 3 || len(page.Title) == 0 {
+		t.Fatalf("rate-limit recovery was incomplete: attempts=%d budget=%d page=%+v", attempts, budget.count(), page)
+	}
+	if !reflect.DeepEqual(delays, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("backoff delays=%v, want [1s 2s]", delays)
+	}
+}
+
+func TestFetchStopsAfterBoundedRateLimitRetries(t *testing.T) {
+	spec := specFor(t, "openai")
+	attempts := 0
+	var delays []time.Duration
+	doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
+		attempts++
+		return htmlResponse(http.StatusTooManyRequests, "rate limited"), nil
+	}}
+	budget := &requestBudget{sleep: func(_ context.Context, delay time.Duration) bool {
+		delays = append(delays, delay)
+		return true
+	}}
+	_, err := fetchAndParsePage(context.Background(), spec, spec.rootURL, CachedPage{}, false, doer, budget, time.Now)
+	if failureCode(err) != "http_status_429" {
+		t.Fatalf("final failure=%v, want http_status_429", err)
+	}
+	wantDelays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if attempts != maxRateLimitRetries+1 || budget.count() != maxRateLimitRetries+1 || !reflect.DeepEqual(delays, wantDelays) {
+		t.Fatalf("rate-limit retry cap not enforced: attempts=%d budget=%d delays=%v", attempts, budget.count(), delays)
+	}
+}
+
+func TestFetchRetriesRateLimitWithNilResponseBody(t *testing.T) {
+	spec := specFor(t, "openai")
+	attempts := 0
+	doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}, nil
+		}
+		return htmlResponse(http.StatusOK, string(fixture(t, "openai-deprecations.html"))), nil
+	}}
+	budget := &requestBudget{sleep: func(context.Context, time.Duration) bool { return true }}
+	if _, err := fetchAndParsePage(context.Background(), spec, spec.rootURL, CachedPage{}, false, doer, budget, time.Now); err != nil {
+		t.Fatalf("nil-body 429 prevented recovery: %v", err)
+	}
+	if attempts != 2 || budget.count() != 2 {
+		t.Fatalf("nil-body 429 retry attempts=%d budget=%d, want 2", attempts, budget.count())
+	}
+}
+
+func TestFetchRateLimitWaitCancellationIsNotReportedAs429(t *testing.T) {
+	spec := specFor(t, "openai")
+	ctx, cancel := context.WithCancel(context.Background())
+	doer := &fakeDoer{handler: func(*http.Request) (*http.Response, error) {
+		return htmlResponse(http.StatusTooManyRequests, "rate limited"), nil
+	}}
+	budget := &requestBudget{sleep: func(context.Context, time.Duration) bool {
+		cancel()
+		return false
+	}}
+	_, err := fetchAndParsePage(ctx, spec, spec.rootURL, CachedPage{}, false, doer, budget, time.Now)
+	if got := failureCode(err); got != "request_cancelled" {
+		t.Fatalf("cancelled rate-limit wait failure=%q, want request_cancelled", got)
+	}
+}
+
+func TestRateLimitRetryDelayHonorsRetryAfterAndRejectsLongWait(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		retryAfter string
+		retry      int
+		want       time.Duration
+		ok         bool
+	}{
+		{name: "exponential first retry", retry: 1, want: time.Second, ok: true},
+		{name: "exponential second retry", retry: 2, want: 2 * time.Second, ok: true},
+		{name: "retry-after seconds", retryAfter: "3", retry: 1, want: 3 * time.Second, ok: true},
+		{name: "retry-after date", retryAfter: now.Add(4 * time.Second).Format(http.TimeFormat), retry: 1, want: 4 * time.Second, ok: true},
+		{name: "server requests long wait", retryAfter: "60", retry: 1, ok: false},
+		{name: "retry-after date beyond cap", retryAfter: now.Add(rateLimitBackoffMax + time.Second).Format(http.TimeFormat), retry: 1, ok: false},
+		{name: "retry limit", retry: maxRateLimitRetries + 1, ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := rateLimitRetryDelay(tc.retryAfter, tc.retry, now)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("retry delay=(%s,%v), want (%s,%v)", got, ok, tc.want, tc.ok)
 			}
 		})
 	}

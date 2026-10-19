@@ -51,31 +51,58 @@ func fetchAlibabaModelStudioCatalog(ctx context.Context, spec sourceSpec, apiKey
 	seen := make(map[string]bool)
 	total, pageSize := -1, -1
 	for pageNo := 1; ; pageNo++ {
-		if !budget.reserve() {
-			return CatalogSnapshot{}, fetchFailure{code: "request_budget_exhausted"}
-		}
 		requestURL := *baseURL
 		query := url.Values{}
 		query.Set("page_no", strconv.Itoa(pageNo))
 		query.Set("page_size", strconv.Itoa(modelStudioPageSize))
 		requestURL.RawQuery = query.Encode()
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
-		if err != nil {
-			return CatalogSnapshot{}, fetchFailure{code: "source_request_invalid"}
-		}
-		request.Header.Set("Authorization", "Bearer "+apiKey)
-		request.Header.Set("Accept", "application/json")
-		response, err := doer.Do(request)
-		if err != nil {
-			return CatalogSnapshot{}, fetchFailure{code: "network_transport_error"}
-		}
-		if response == nil || response.Body == nil {
-			return CatalogSnapshot{}, fetchFailure{code: "http_error"}
-		}
-		body, statusCode, readErr := readLimitedResponse(response)
-		response.Body.Close()
-		if readErr != nil {
-			return CatalogSnapshot{}, fetchFailure{code: "response_too_large_or_empty"}
+		var body []byte
+		var statusCode int
+		for retry := 0; ; {
+			if !budget.reserve() {
+				return CatalogSnapshot{}, fetchFailure{code: "request_budget_exhausted"}
+			}
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
+			if err != nil {
+				return CatalogSnapshot{}, fetchFailure{code: "source_request_invalid"}
+			}
+			request.Header.Set("Authorization", "Bearer "+apiKey)
+			request.Header.Set("Accept", "application/json")
+			response, err := doer.Do(request)
+			if err != nil {
+				return CatalogSnapshot{}, fetchFailure{code: "network_transport_error"}
+			}
+			if response == nil {
+				return CatalogSnapshot{}, fetchFailure{code: "http_error"}
+			}
+			if response.StatusCode == http.StatusTooManyRequests {
+				retryAfter := response.Header.Get("Retry-After")
+				if response.Body != nil {
+					_ = response.Body.Close()
+				}
+				if retry >= maxRateLimitRetries {
+					return CatalogSnapshot{}, fetchFailure{code: "http_status_429"}
+				}
+				delay, retryable := rateLimitRetryDelay(retryAfter, retry+1, time.Now())
+				if !retryable {
+					return CatalogSnapshot{}, fetchFailure{code: "http_status_429"}
+				}
+				if !budget.wait(ctx, delay) {
+					return CatalogSnapshot{}, rateLimitWaitFailure(ctx)
+				}
+				retry++
+				continue
+			}
+			if response.Body == nil {
+				return CatalogSnapshot{}, fetchFailure{code: "http_error"}
+			}
+			var readErr error
+			body, statusCode, readErr = readLimitedResponse(response)
+			_ = response.Body.Close()
+			if readErr != nil {
+				return CatalogSnapshot{}, fetchFailure{code: "response_too_large_or_empty"}
+			}
+			break
 		}
 		if statusCode != http.StatusOK {
 			zero(body)

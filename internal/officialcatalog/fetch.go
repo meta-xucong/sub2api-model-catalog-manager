@@ -24,6 +24,9 @@ const (
 	StartupSyncTimeout     = 60 * time.Second
 	ProviderSyncTimeout    = 10 * time.Second
 	MaxHTTPGets            = 102
+	maxRateLimitRetries    = 3
+	rateLimitBackoffBase   = time.Second
+	rateLimitBackoffMax    = 8 * time.Second
 	MaxRedirects           = 2
 	MaxAlibabaNotices      = 16
 	MaxXAIMigrations       = 8
@@ -135,7 +138,10 @@ type fetchFailure struct{ code string }
 
 func (f fetchFailure) Error() string { return f.code }
 
-type requestBudget struct{ used atomic.Int64 }
+type requestBudget struct {
+	used  atomic.Int64
+	sleep func(context.Context, time.Duration) bool
+}
 
 func (b *requestBudget) reserve() bool {
 	for {
@@ -150,6 +156,55 @@ func (b *requestBudget) reserve() bool {
 }
 
 func (b *requestBudget) count() int { return int(b.used.Load()) }
+
+func (b *requestBudget) wait(ctx context.Context, delay time.Duration) bool {
+	if ctx == nil || delay <= 0 {
+		return false
+	}
+	if b != nil && b.sleep != nil {
+		return b.sleep(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func rateLimitRetryDelay(retryAfter string, retry int, now time.Time) (time.Duration, bool) {
+	if retry < 1 || retry > maxRateLimitRetries {
+		return 0, false
+	}
+	delay := rateLimitBackoffBase << (retry - 1)
+	if value := strings.TrimSpace(retryAfter); value != "" {
+		if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+			if seconds > int64(rateLimitBackoffMax/time.Second) {
+				return 0, false
+			}
+			if seconds > 0 {
+				delay = time.Duration(seconds) * time.Second
+			}
+		} else if retryAt, err := http.ParseTime(value); err == nil {
+			if wait := retryAt.Sub(now); wait > 0 {
+				if wait > rateLimitBackoffMax {
+					return 0, false
+				}
+				delay = wait
+			}
+		}
+	}
+	return delay, delay > 0 && delay <= rateLimitBackoffMax
+}
+
+func rateLimitWaitFailure(ctx context.Context) error {
+	if ctx != nil && ctx.Err() != nil {
+		return fetchFailure{code: "request_cancelled"}
+	}
+	return fetchFailure{code: "http_status_429"}
+}
 
 func NewHTTPClient() *http.Client {
 	return &http.Client{
@@ -448,36 +503,60 @@ func fetchAndParsePage(ctx context.Context, spec sourceSpec, rawURL string, prio
 	}
 	current := rawURL
 	for redirects := 0; redirects <= MaxRedirects; redirects++ {
-		if !budget.reserve() {
-			return CachedPage{}, fetchFailure{code: "source_request_budget_exceeded"}
-		}
-		reqCtx, cancel := context.WithTimeout(ctx, ProviderSyncTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, current, nil)
-		if err != nil {
-			cancel()
-			return CachedPage{}, fetchFailure{code: "source_request_invalid"}
-		}
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1")
-		req.Header.Set("User-Agent", "sub2api-model-catalog-manager/official-lifecycle-review")
-		if spec.provider == "alibaba" && isAlibabaRendererRequestURL(current) {
-			req.Header.Set("Accept", "application/json")
-			req.Header.Set("Origin", "https://www.aliyun.com")
-		}
-		if current == rawURL && hasPrior {
-			if prior.ETag != "" {
-				req.Header.Set("If-None-Match", prior.ETag)
+		var resp *http.Response
+		var cancel context.CancelFunc
+		for retry := 0; ; {
+			if !budget.reserve() {
+				return CachedPage{}, fetchFailure{code: "source_request_budget_exceeded"}
 			}
-			if prior.LastModified != "" {
-				req.Header.Set("If-Modified-Since", prior.LastModified)
+			reqCtx, requestCancel := context.WithTimeout(ctx, ProviderSyncTimeout)
+			cancel = requestCancel
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, current, nil)
+			if err != nil {
+				cancel()
+				return CachedPage{}, fetchFailure{code: "source_request_invalid"}
 			}
-		}
-		resp, err := doer.Do(req)
-		if err != nil || resp == nil {
-			if resp != nil && resp.Body != nil {
+			req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1")
+			req.Header.Set("User-Agent", "sub2api-model-catalog-manager/official-lifecycle-review")
+			if spec.provider == "alibaba" && isAlibabaRendererRequestURL(current) {
+				req.Header.Set("Accept", "application/json")
+				req.Header.Set("Origin", "https://www.aliyun.com")
+			}
+			if current == rawURL && hasPrior {
+				if prior.ETag != "" {
+					req.Header.Set("If-None-Match", prior.ETag)
+				}
+				if prior.LastModified != "" {
+					req.Header.Set("If-Modified-Since", prior.LastModified)
+				}
+			}
+			resp, err = doer.Do(req)
+			if err != nil || resp == nil {
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				cancel()
+				return CachedPage{}, fetchFailure{code: "http_error"}
+			}
+			if resp.StatusCode != http.StatusTooManyRequests {
+				break
+			}
+			retryAfter := resp.Header.Get("Retry-After")
+			if resp.Body != nil {
 				_ = resp.Body.Close()
 			}
 			cancel()
-			return CachedPage{}, fetchFailure{code: "http_error"}
+			if retry >= maxRateLimitRetries {
+				return CachedPage{}, fetchFailure{code: "http_status_429"}
+			}
+			delay, retryable := rateLimitRetryDelay(retryAfter, retry+1, time.Now())
+			if !retryable {
+				return CachedPage{}, fetchFailure{code: "http_status_429"}
+			}
+			if !budget.wait(ctx, delay) {
+				return CachedPage{}, rateLimitWaitFailure(ctx)
+			}
+			retry++
 		}
 		if isRedirect(resp.StatusCode) {
 			location := resp.Header.Get("Location")
