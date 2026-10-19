@@ -149,3 +149,15 @@ base GPT versions. Unknown or ambiguous ID shapes, different families, and statu
 `insufficient_evidence` or `ignored` never cascade. This rule authorizes
 unmanaged mapping removal only after the trigger itself has passed the existing
 validated negative-evidence contract.
+
+Verification and deployment: `go test ./...`, `go vet ./...`, Linux amd64
+build, `gofmt`, `git diff --check`, full `ApprovalPlan.ValidateShape` cascade
+regression, and independent read-only audit passed. Commit `ac1ddc0` was pushed
+to `origin/codex/official-selectability-auto-sync`. The Linux binary SHA-256
+`02f54aeeac25eb9acb20fd5d04463f250e9fb0a39eecf41088bf186a36079aa9` was
+atomically installed at `/opt/codex-usb-license-revocation/model-catalog-manager`.
+The previous binary is preserved at
+`/var/backups/codex-usb-license-revocation/deploy-20261019T163107Z/model-catalog-manager`.
+Remote SHA-256 and executable ownership/mode (`root:root`, `0755`) were verified;
+the license service stayed active with the same main PID. No screening or
+mapping Apply was run during this deployment.
