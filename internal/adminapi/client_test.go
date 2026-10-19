@@ -738,10 +738,13 @@ func TestNewPinsTrustedOriginAndRequestsRequireKey(t *testing.T) {
 }
 
 func TestProbeModelUsesDeployedAccountTestEndpointAndParsesTerminalSSE(t *testing.T) {
-	for _, tc := range []struct{ name, stream, want string }{
-		{"success", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":true}\n\n", "succeeded"},
-		{"terminal_failure", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":false}\n\n", "failed"},
-		{"provider_failure", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"error\",\"message\":\"secret provider text\"}\n\n", "failed"},
+	for _, tc := range []struct {
+		name, stream, want string
+		wantErr            bool
+	}{
+		{"success", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":true}\n\n", "succeeded", false},
+		{"terminal_failure_without_reason_is_incomplete", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"test_complete\",\"success\":false}\n\n", "", true},
+		{"structured_model_not_found", "data: {\"type\":\"test_start\",\"model\":\"gpt-5.5\"}\n\ndata: {\"type\":\"error\",\"error\":\"OpenAI API returned 404: {\\\"error\\\":{\\\"code\\\":\\\"model_not_found\\\"}}\"}\n\n", "failed", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newHandlerClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -760,6 +763,12 @@ func TestProbeModelUsesDeployedAccountTestEndpointAndParsesTerminalSSE(t *testin
 				t.Fatal(err)
 			}
 			got, err := client.ProbeModel(context.Background(), 42, "gpt-5.5")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("inconclusive probe unexpectedly produced a terminal classification: %#v", got)
+				}
+				return
+			}
 			if err != nil || got.ModelID != "gpt-5.5" || got.Outcome != tc.want {
 				t.Fatalf("probe result = %#v, err=%v", got, err)
 			}

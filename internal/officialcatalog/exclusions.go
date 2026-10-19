@@ -302,7 +302,7 @@ func EvaluateProductAvailability(syncResult StartupSyncResult, modelIDs []string
 					floorIDs = append(floorIDs, listedID)
 				}
 			}
-			if spec.versionFloorCatalog && olderThanProductVersionFloor(spec.scope, modelID, floorIDs) {
+			if spec.versionFloorCatalog && spec.versionFloorCoversAcceptedUnion && olderThanProductVersionFloor(spec.scope, modelID, floorIDs) {
 				versionFloor = &AvailableModelCatalog{
 					SourceID: spec.id, SourceIDs: []string{spec.id}, Provider: spec.provider, Scope: spec.scope,
 					ModelIDs: append([]string(nil), page.AvailableModelIDs...), SourceURL: page.URL, SourceTitle: page.Title,

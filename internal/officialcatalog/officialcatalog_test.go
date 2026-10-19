@@ -790,8 +790,8 @@ func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
 	for _, item := range ids {
 		byID[item.ModelID] = item
 	}
-	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_version_floor" || byID["gpt-5.5"].Status != "unavailable" {
-		t.Fatalf("older GPT versions should fall below the official floor while exact cross-product retirement remains attributed separately: %+v", ids)
+	if byID["gpt-5.4"].Status != "insufficient_evidence" || byID["gpt-5.4"].MatchKind != "none" || byID["gpt-5.5"].Status != "unavailable" {
+		t.Fatalf("Codex-only absence must remain insufficient for the ChatGPT web + Codex union while cross-product retirement is decisive: %+v", ids)
 	}
 	if byID["gpt-4o-audio-preview"].Status != "insufficient_evidence" {
 		t.Fatalf("specialized product IDs must remain unknown without complete union evidence: %+v", byID["gpt-4o-audio-preview"])
@@ -815,15 +815,15 @@ func TestUnavailableRequiresEvidenceCoveringAcceptedProductUnion(t *testing.T) {
 	if byID["gpt-4o-audio-preview"].Status != "unavailable" || byID["gpt-4o-audio-preview"].MatchKind != "accepted_union_absence" {
 		t.Fatalf("only an audited complete accepted-union catalog can establish absence for specialized model families: %+v", byID["gpt-4o-audio-preview"])
 	}
-	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_version_floor" {
-		t.Fatalf("version-floor exclusion should remain independently attributed: %+v", byID["gpt-5.4"])
+	if byID["gpt-5.4"].Status != "unavailable" || byID["gpt-5.4"].MatchKind != "accepted_union_absence" {
+		t.Fatalf("only an explicitly complete accepted-union catalog should establish GPT absence: %+v", byID["gpt-5.4"])
 	}
 	if byID["gpt-5.5"].Status != "unavailable" || byID["gpt-5.5"].MatchKind != "accepted_union_retirement" {
 		t.Fatalf("only an audited accepted-union lifecycle source can establish retirement: %+v", byID["gpt-5.5"])
 	}
 }
 
-func TestOlderVersionsBelowOfficialProductFloorAreUnavailable(t *testing.T) {
+func TestGPTCodexFloorDoesNotImplyChatGPTUnionAbsence(t *testing.T) {
 	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
 	openAI := makeProductScopeResult(t, "openai_codex_chatgpt_login", now, false, false)
 	openAIAvailability := EvaluateProductAvailability(openAI, []string{
@@ -835,8 +835,8 @@ func TestOlderVersionsBelowOfficialProductFloorAreUnavailable(t *testing.T) {
 	}
 	for _, id := range []string{"gpt-5.2", "gpt-5.4", "gpt-5.5-openai-compact"} {
 		item := byID[id]
-		if item.Status != "unavailable" || item.MatchKind != "accepted_union_version_floor" || len(item.SourceIDs) != 1 || item.SourceIDs[0] != "openai-codex-models" {
-			t.Errorf("older GPT version %s must be rejected by the official current-version floor: %+v", id, item)
+		if item.Status != "insufficient_evidence" || item.MatchKind != "none" {
+			t.Errorf("Codex-only version floor must not reject %s across ChatGPT web + Codex: %+v", id, item)
 		}
 	}
 	if olderThanProductVersionFloor("openai_codex_chatgpt_login", "gpt-5.3-codex-spark", []string{"gpt-5.6", "gpt-6"}) {

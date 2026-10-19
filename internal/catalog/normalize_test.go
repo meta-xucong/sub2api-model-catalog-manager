@@ -36,21 +36,26 @@ func TestVersionFloorEvidenceIsBoundToApprovedOfficialCatalogs(t *testing.T) {
 		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
 		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC),
 	}
-	if err := validateProductModelAvailability(base); err != nil {
-		t.Fatalf("approved OpenAI version-floor evidence was rejected: %v", err)
+	if err := validateProductModelAvailability(base); err == nil {
+		t.Fatal("Codex-only floor was accepted as ChatGPT web + Codex union evidence")
+	}
+	base = ProductModelAvailability{
+		ModelID: "grok-4.3", Provider: "xai", Status: "unavailable", MatchKind: "accepted_union_version_floor",
+		SourceIDs: []string{"xai-grok-web-models"}, SourceURLs: []string{"https://x.ai/news/grok-4-5-everywhere"},
+		ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC),
 	}
 	for _, tc := range []struct {
 		name string
 		edit func(*ProductModelAvailability)
 	}{
 		{name: "unrecognized source", edit: func(item *ProductModelAvailability) { item.SourceIDs = []string{"arbitrary-source"} }},
-		{name: "mismatched provider", edit: func(item *ProductModelAvailability) { item.Provider = "xai" }},
-		{name: "model outside provider family", edit: func(item *ProductModelAvailability) { item.ModelID = "grok-4.3" }},
-		{name: "separate Codex Spark family", edit: func(item *ProductModelAvailability) { item.ModelID = "gpt-5.4-codex-spark" }},
+		{name: "mismatched provider", edit: func(item *ProductModelAvailability) { item.Provider = "openai" }},
+		{name: "model outside provider family", edit: func(item *ProductModelAvailability) { item.ModelID = "gpt-5.4" }},
+		{name: "unrecognized Grok family", edit: func(item *ProductModelAvailability) { item.ModelID = "grok-imagine-video-2" }},
 		{name: "mismatched URL", edit: func(item *ProductModelAvailability) { item.SourceURLs = []string{"https://example.com/models"} }},
 		{name: "multiple sources", edit: func(item *ProductModelAvailability) {
-			item.SourceIDs = []string{"openai-codex-models", "xai-grok-web-models"}
-			item.SourceURLs = []string{"https://developers.openai.com/codex/models", "https://x.ai/news/grok-4-5-everywhere"}
+			item.SourceIDs = []string{"xai-grok-web-models", "xai-grok-web-models-copy"}
+			item.SourceURLs = []string{"https://x.ai/news/grok-4-5-everywhere", "https://x.ai/news/grok-4-5-everywhere-copy"}
 			item.ContentSHA256 = []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
 		}},
 	} {
@@ -66,9 +71,6 @@ func TestVersionFloorEvidenceIsBoundToApprovedOfficialCatalogs(t *testing.T) {
 		})
 	}
 	grok := base
-	grok.ModelID, grok.Provider = "grok-4.3", "xai"
-	grok.SourceIDs = []string{"xai-grok-web-models"}
-	grok.SourceURLs = []string{"https://x.ai/news/grok-4-5-everywhere"}
 	if err := validateProductModelAvailability(grok); err != nil {
 		t.Fatalf("approved Grok version-floor evidence was rejected: %v", err)
 	}
@@ -770,7 +772,7 @@ func TestIncompleteAccountProbePreservesExactTargetMapping(t *testing.T) {
 	}
 }
 
-func TestAcceptedUnionAndVersionFloorUnavailableRemoveRelayPresentIDs(t *testing.T) {
+func TestAcceptedUnionRetirementRemovesAndIgnoredGPTFloorPreservesRelayIDs(t *testing.T) {
 	s := sourceFixture()
 	rules := identitySyncRules(s)
 	fingerprint := SourceFingerprint(s)
@@ -785,15 +787,15 @@ func TestAcceptedUnionAndVersionFloorUnavailableRemoveRelayPresentIDs(t *testing
 		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
 		ContentSHA256: []string{strings.Repeat("e", 64)}, RetrievedAt: now,
 	}
-	versionFloor := ProductModelAvailability{
-		ModelID: "gpt-5.4", Provider: "openai", Status: "unavailable", MatchKind: "accepted_union_version_floor",
-		SourceIDs: []string{"openai-codex-models"}, SourceURLs: []string{"https://developers.openai.com/codex/models"},
-		ContentSHA256: []string{strings.Repeat("f", 64)}, RetrievedAt: now,
-	}
 	current := map[string]string{"gpt-5.5": "gpt-5.5", "gpt-5.4": "gpt-5.4", "custom-route": "gpt-5.5"}
 	in := identitySyncInput(s, current, []string{"gpt-5.5", "gpt-5.4", "gpt-6-sol"})
 	in.ProductAvailabilityEnforced = true
-	in.ProductAvailability = []ProductModelAvailability{unavailable, versionFloor, positive}
+	ignoredFloor := ProductModelAvailability{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored",
+		SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"},
+		ContentSHA256: []string{strings.Repeat("f", 64)}, RetrievedAt: now,
+	}
+	in.ProductAvailability = []ProductModelAvailability{unavailable, ignoredFloor, positive}
 	in.ManagedMappings = map[string]state.ManagedMapping{
 		"gpt-5.5":      {LastAppliedValue: "gpt-5.5", SourceFingerprint: fingerprint},
 		"gpt-5.4":      {LastAppliedValue: "gpt-5.4", SourceFingerprint: fingerprint},
@@ -803,11 +805,11 @@ func TestAcceptedUnionAndVersionFloorUnavailableRemoveRelayPresentIDs(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.ApplyEligible || plan.After["gpt-5.5"] != "" || plan.After["gpt-5.4"] != "" || plan.After["custom-route"] != "" || plan.After["gpt-6-sol"] != "gpt-6-sol" {
-		t.Fatalf("accepted-union retirement or version-floor evidence did not remove stale relay IDs while keeping the exact positive: %#v", plan)
+	if !plan.ApplyEligible || plan.After["gpt-5.5"] != "" || plan.After["gpt-5.4"] != "gpt-5.4" || plan.After["custom-route"] != "" || plan.After["gpt-6-sol"] != "gpt-6-sol" {
+		t.Fatalf("union retirement should remove stale routes while ignored Codex-only floor preserves GPT mapping: %#v", plan)
 	}
-	if len(plan.Changes) != 4 {
-		t.Fatalf("expected three stale-mapping removals and one exact positive add, got %#v", plan.Changes)
+	if len(plan.Changes) != 3 {
+		t.Fatalf("expected two retirement removals and one exact positive add, got %#v", plan.Changes)
 	}
 
 	in.ManagedMappings = map[string]state.ManagedMapping{}
@@ -815,14 +817,14 @@ func TestAcceptedUnionAndVersionFloorUnavailableRemoveRelayPresentIDs(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !approvedCandidate.ApplyEligible || len(approvedCandidate.Conflicts) != 0 || approvedCandidate.After["gpt-5.5"] != "" || approvedCandidate.After["gpt-5.4"] != "" || approvedCandidate.After["custom-route"] != "" {
+	if !approvedCandidate.ApplyEligible || len(approvedCandidate.Conflicts) != 0 || approvedCandidate.After["gpt-5.5"] != "" || approvedCandidate.After["gpt-5.4"] != "gpt-5.4" || approvedCandidate.After["custom-route"] != "" {
 		t.Fatalf("official product-union evidence should propose removals even for mappings not previously managed by this tool: %#v", approvedCandidate)
 	}
 	unboundedAbsence := unavailable
 	unboundedAbsence.MatchKind = "accepted_union_absence"
 	unboundedAbsence.SourceIDs = []string{"unreviewed-source"}
 	unboundedAbsence.SourceURLs = []string{"https://example.com/models"}
-	in.ProductAvailability = []ProductModelAvailability{unboundedAbsence, versionFloor, positive}
+	in.ProductAvailability = []ProductModelAvailability{unboundedAbsence, ignoredFloor, positive}
 	blockedAbsence, err := Normalize(rules, in, state.Account{})
 	if err != nil {
 		t.Fatal(err)

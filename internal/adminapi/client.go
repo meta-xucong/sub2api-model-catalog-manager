@@ -129,7 +129,7 @@ type CatalogWarning struct {
 
 type ModelProbeResult struct {
 	ModelID string
-	Outcome string // succeeded or failed; transport/protocol incompleteness is an error.
+	Outcome string // succeeded or failed; inconclusive provider errors are returned as errors.
 }
 
 type BulkUpdateResult struct {
@@ -456,6 +456,9 @@ func (c *Client) ProbeModel(ctx context.Context, id int64, modelID string) (Mode
 			Type    string `json:"type"`
 			Model   string `json:"model"`
 			Success bool   `json:"success"`
+			Status  string `json:"status"`
+			Code    string `json:"code"`
+			Error   string `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil || event.Type == "" {
 			return ModelProbeResult{}, errors.New("model probe returned malformed SSE")
@@ -474,7 +477,14 @@ func (c *Client) ProbeModel(ctx context.Context, id int64, modelID string) (Mode
 			if !started || terminal != "" {
 				return ModelProbeResult{}, errors.New("model probe returned an invalid error event")
 			}
-			terminal = "failed"
+			if event.Model != "" && event.Model != modelID {
+				return ModelProbeResult{}, errors.New("model probe error referenced a different model; result is incomplete")
+			}
+			if definitiveModelProbeFailure(modelID, event.Status, event.Code, event.Error) {
+				terminal = "failed"
+			} else {
+				return ModelProbeResult{}, errors.New("model probe returned an inconclusive provider error")
+			}
 		case "test_complete":
 			if !started || terminal != "" {
 				return ModelProbeResult{}, errors.New("model probe returned an invalid terminal event")
@@ -485,7 +495,7 @@ func (c *Client) ProbeModel(ctx context.Context, id int64, modelID string) (Mode
 			if event.Success {
 				terminal = "succeeded"
 			} else {
-				terminal = "failed"
+				return ModelProbeResult{}, errors.New("model probe completed without evidence that the model is unsupported")
 			}
 		}
 		if terminal != "" {
@@ -499,6 +509,112 @@ func (c *Client) ProbeModel(ctx context.Context, id int64, modelID string) (Mode
 		return ModelProbeResult{}, errors.New("model probe stream ended without a terminal event")
 	}
 	return ModelProbeResult{ModelID: modelID, Outcome: terminal}, nil
+}
+
+// definitiveModelProbeFailure accepts only explicit, structured model-level
+// failures. The deployed Sub2API account-test SSE contract sends provider
+// failures as TestEvent{Type:"error", Error:<formatted text>}; HTTP failures
+// are rendered as "<API> returned <status>: <JSON body>". Bare HTTP 4xx/5xx,
+// test_complete(success=false), free-form messages, and unknown codes are not
+// enough to conclude that a model is unavailable and must be treated as
+// inconclusive by the caller.
+func definitiveModelProbeFailure(expectedModelID, eventStatus, eventCode, errorText string) bool {
+	status, code := 0, normalizeModelFailureCode(eventCode)
+	if eventStatus != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(eventStatus))
+		if err != nil {
+			return false
+		}
+		status = parsed
+	}
+	if errorText != "" {
+		parsedStatus, payload, ok := parseAccountTestHTTPError(errorText)
+		if ok {
+			if status != 0 && status != parsedStatus {
+				return false
+			}
+			status = parsedStatus
+			bodyCode, bodyModel, bodyOK := structuredModelError(payload)
+			if !bodyOK || bodyModel != "" && bodyModel != expectedModelID {
+				return false
+			}
+			if bodyCode != "" {
+				if code != "" && code != bodyCode {
+					return false
+				}
+				code = bodyCode
+			}
+		} else if status == 0 || code == "" {
+			return false
+		}
+	}
+	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	return isModelNotFoundCode(code)
+}
+
+func isModelNotFoundCode(code string) bool {
+	switch code {
+	case "model_not_found", "model_not_supported", "unsupported_model":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseAccountTestHTTPError(message string) (int, []byte, bool) {
+	marker := strings.Index(message, " returned ")
+	if marker < 0 {
+		return 0, nil, false
+	}
+	rest := message[marker+len(" returned "):]
+	statusText, payloadText, ok := strings.Cut(rest, ":")
+	if !ok {
+		return 0, nil, false
+	}
+	status, err := strconv.Atoi(strings.TrimSpace(statusText))
+	if err != nil || status < 400 || status > 599 {
+		return 0, nil, false
+	}
+	payload := []byte(strings.TrimSpace(payloadText))
+	if len(payload) == 0 || !json.Valid(payload) {
+		return 0, nil, false
+	}
+	return status, payload, true
+}
+
+func structuredModelError(payload []byte) (code, model string, ok bool) {
+	var envelope struct {
+		Code  string `json:"code"`
+		Model string `json:"model"`
+		Error struct {
+			Code  string `json:"code"`
+			Param string `json:"param"`
+			Model string `json:"model"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return "", "", false
+	}
+	code = normalizeModelFailureCode(envelope.Error.Code)
+	if code == "" {
+		code = normalizeModelFailureCode(envelope.Code)
+	}
+	param := strings.ToLower(strings.TrimSpace(envelope.Error.Param))
+	model = strings.TrimSpace(envelope.Error.Model)
+	if model == "" {
+		model = strings.TrimSpace(envelope.Model)
+	}
+	if param != "" && param != "model" {
+		return "", "", false
+	}
+	return code, model, true
+}
+
+func normalizeModelFailureCode(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	return strings.ReplaceAll(code, "-", "_")
 }
 
 func validProbeModelID(modelID string) bool {

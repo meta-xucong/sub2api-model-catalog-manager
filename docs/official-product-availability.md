@@ -53,14 +53,13 @@ both ChatGPT and Codex; only that cross-product wording qualifies for
 accepted-union exclusion. Grok Build, Cursor, API, cloud, and developer
 listings do not establish Grok consumer web availability.
 
-For the user's requested stale-version screening, the official Codex signed-in
-model listing and the exact Grok consumer-web announcement also establish a
-version floor for their own canonical version families. An observed candidate
-strictly below that source's lowest currently listed canonical version is
-reported as `unavailable` with `accepted_union_version_floor` and the source
-URL/hash. This is a conservative negative inference within the same family;
-it does not make higher unlisted versions available, and the separate
-`gpt-5.3-codex-spark` family does not lower the base GPT floor. Exact current
+The exact Grok consumer-web announcement can establish a version floor because
+Grok's accepted scope here is that single web surface. The Codex model listing
+does not establish a GPT version floor for the combined ChatGPT web + Codex
+scope: an older GPT ID absent from Codex remains `insufficient_evidence`
+unless current ChatGPT evidence, a complete union catalog, or an explicit
+cross-product retirement also rules it out. The separate
+`gpt-5.3-codex-spark` family does not alter the base GPT family. Exact current
 positive evidence remains required to mark a model `available`.
 
 When accepted-union evidence marks an exact model unavailable, discovery
@@ -71,10 +70,13 @@ plan and source/mapping snapshot checks, and backup before remote writes.
 Manual apply requires confirmation of the exact plan hash. Configured
 `approved_rules` automatic apply may consume fresh matching evidence without a
 per-plan confirmation; enabling it is the operator's standing authorization
-for rules whose raw hash is pinned in config. Only the bound Codex/Grok version
-floor sources and the bound OpenAI cross-product retirement source can propose
-removal of unmanaged mappings. Account-scoped API catalog absences retain the
-stricter managed-mapping ownership and drift checks.
+for rules whose raw hash is pinned in config. For official-product evidence,
+only the Grok web version-floor source and the bound OpenAI cross-product
+retirement source can propose removal of unmanaged mappings. A Codex-only GPT
+floor cannot authorize removal across the ChatGPT web + Codex union. Exact
+all-account probe failures remain governed by the separate probe contract.
+Account-scoped API catalog absences retain the stricter managed-mapping
+ownership and drift checks.
 
 The Claude consumer display-name aliases are explicitly cross-checked by a
 focused test against exact IDs in the official Claude Code model page fixture;

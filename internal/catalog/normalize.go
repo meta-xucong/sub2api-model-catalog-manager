@@ -76,8 +76,7 @@ type ProductModelAvailability struct {
 }
 
 var (
-	openAIVersionFloorModelID = regexp.MustCompile(`^gpt-\d+\.\d+(?:-[a-z0-9][a-z0-9-]*)?$`)
-	xAIVersionFloorModelID    = regexp.MustCompile(`^grok-\d+\.\d+(?:-[a-z0-9][a-z0-9-]*)?$`)
+	xAIVersionFloorModelID = regexp.MustCompile(`^grok-\d+\.\d+(?:-[a-z0-9][a-z0-9-]*)?$`)
 )
 
 type Change struct {
@@ -1224,7 +1223,6 @@ func validateProductModelAvailability(item ProductModelAvailability) error {
 			return errors.New("version-floor evidence must identify exactly one approved official catalog")
 		}
 		switch {
-		case item.Provider == "openai" && item.SourceIDs[0] == "openai-codex-models" && item.SourceURLs[0] == "https://developers.openai.com/codex/models" && openAIVersionFloorModelID.MatchString(strings.ToLower(item.ModelID)) && !strings.Contains(strings.ToLower(item.ModelID), "codex-spark"):
 		case item.Provider == "xai" && item.SourceIDs[0] == "xai-grok-web-models" && item.SourceURLs[0] == "https://x.ai/news/grok-4-5-everywhere" && xAIVersionFloorModelID.MatchString(strings.ToLower(item.ModelID)):
 		default:
 			return errors.New("version-floor evidence is not bound to an approved provider catalog")
