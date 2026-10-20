@@ -217,7 +217,7 @@ func TestMergeReviewCommandUsesOnlyLocalFilesAndWritesCandidateReport(t *testing
 	}
 	const sentinel = "MERGE-REVIEW-CLI-SECRET-SENTINEL"
 	inspect := `{"run_id":"inspect-test","created_at":"2026-10-12T11:00:00Z","mode":"inspect","account_scope":"all","account_scan_status":"complete","account_inventory_count":1,"account_inventory_sha256":"` + idsHash + `","target_build_fingerprint":"build-test","accounts":[{"account_id":9001,"platform":"openai","account_type":"apikey","api_protocol":"openai","base_url":"https://provider.example/v1","source_fingerprint":"` + fingerprint + `","mapping_sha256":"` + mappingHash + `","mapping_status":"explicit_nonempty","credential_shadow":false,"mappings":[{"public_id":"model","upstream_id":"model"}],"credentials":{"api_key":"` + sentinel + `"},"headers":{"authorization":"` + sentinel + `"}}]}`
-	discover := `{"run_id":"discover-test","created_at":"2026-10-12T11:01:00Z","mode":"discover","account_scope":"all","account_scan_status":"complete","account_inventory_count":1,"account_inventory_sha256":"` + idsHash + `","target_build_fingerprint":"build-test","discovery":[{"account_id":9001,"source_fingerprint":"` + fingerprint + `","status":"candidate_reported","live_list_available":true,"models":["model","model-20261012"]}]}`
+	discover := `{"run_id":"discover-test","created_at":"2026-10-12T11:01:00Z","mode":"discover","account_scope":"all","account_scan_status":"complete","account_inventory_count":1,"account_inventory_sha256":"` + idsHash + `","target_build_fingerprint":"build-test","discovery":[{"account_id":9001,"source_fingerprint":"` + fingerprint + `","status":"candidate_reported","live_list_available":true,"models":["model","model-20261012"],"product_availability":[{"model_id":"model","provider":"openai","status":"available","match_kind":"exact"},{"model_id":"model-20261012","provider":"openai","status":"available","match_kind":"exact"}]}]}`
 	for path, body := range map[string]string{inspectPath: inspect, discoverPath: discover} {
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
@@ -753,14 +753,14 @@ func TestFullScreenPreviewOnlyDoesNotApplyEvenWithMatchingApproval(t *testing.T)
 	stdout, err := captureStdout(t, func() error {
 		return runAutomaticWith([]string{"--config", configPath, "--full-screen", "--preview-only"}, mockCredentialReader, func(string) (app.AdminAPI, error) { return api, nil })
 	})
-	if err == nil {
-		t.Fatal("preview-only full-screen result should not report success")
+	if err != nil {
+		t.Fatalf("successful preview-only full-screen run returned an error: %v", err)
 	}
 	if api.syncCalls != 1 || api.bulkCalls != 0 || api.statusCalls != 1 {
 		t.Fatalf("preview-only full screen crossed the mapping-write boundary: sync=%d bulk=%d status=%d", api.syncCalls, api.bulkCalls, api.statusCalls)
 	}
 	var terminal fullScreenResult
-	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "failed" || terminal.ReasonCode != "configuration_invalid" || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
+	if json.Unmarshal([]byte(stdout), &terminal) != nil || terminal.Status != "preview" || terminal.ReasonCode != "preview_only" || terminal.AppliedCount != 0 || terminal.FailedCount != 0 || terminal.NotAttemptedCount != 1 {
 		t.Fatalf("preview-only full-screen result is inconsistent: stdout=%q terminal=%#v", stdout, terminal)
 	}
 }
@@ -843,6 +843,7 @@ func TestFullScreenPartialAfterVerifiedWritePreservesNativeRefreshGateReason(t *
 			account2 := account1
 			account2.ID = 9002
 			api.accounts = map[int64]adminapi.Account{account1.ID: account1, account2.ID: account2}
+			api.catalog.Models = append(api.catalog.Models, "new-model")
 			api.catalogs = map[int64]adminapi.Catalog{
 				account1.ID: api.catalog,
 				account2.ID: api.catalog,
@@ -973,7 +974,7 @@ func automaticFixture(t *testing.T, approvedHash string) (string, *mainWorkflowA
 	rules := catalog.Rules{
 		SchemaVersion:         1,
 		Aliases:               []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "reviewed exact mock rule", ReviewedAt: date}},
-		SourceProfiles:        []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", OfficialSelectabilityScope: "official-account:test-openai-account", Evidence: "mock-only build/API scope", ReviewedAt: date}},
+		SourceProfiles:        []catalog.SourceProfile{{Source: source, BuildID: "verified-image", APIContractID: "admin-catalog-v1", Decision: "approved", IdentityAddPolicy: "add_exact", OfficialSelectabilityScope: "official-account:test-openai-account", OfficialSelectabilityProduct: "ui", Evidence: "mock-only build/API scope", ReviewedAt: date}},
 		OfficialSelectability: []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "new-model", "canonical-name", "keep", "raw-v2"}, ObservedAt: now.Add(-time.Minute), ExpiresAt: now.Add(23 * time.Hour), Evidence: "synthetic complete selector fixture"}},
 		VersionFamilies:       []catalog.VersionFamily{}, RetiredModels: []catalog.RetiredRule{}, CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 	}
@@ -1054,6 +1055,11 @@ func fullScreenFixture(t *testing.T, mismatch bool) (string, *mainWorkflowAPI) {
 		t.Fatal(err)
 	}
 	api.status.RunStatus = "partial_failure"
+	// Full-screen absence pruning uses the native 404token list as its source
+	// of truth. Keep the fixture's existing unmanaged mapping in that list so
+	// these apply-path tests exercise the approved addition instead of the
+	// intentional unmanaged-missing-ID conflict boundary.
+	api.catalog.Models = append(api.catalog.Models, "keep")
 	return configPath, api
 }
 
@@ -1137,6 +1143,9 @@ func (m *mainWorkflowAPI) SyncUpstream(_ context.Context, id int64) (adminapi.Ca
 		return catalog, nil
 	}
 	return m.catalog, nil
+}
+func (m *mainWorkflowAPI) ProbeModel(_ context.Context, id int64, modelID string) (adminapi.ModelProbeResult, error) {
+	return adminapi.ModelProbeResult{ModelID: modelID, Outcome: "succeeded"}, nil
 }
 func (m *mainWorkflowAPI) BulkUpdateMapping(_ context.Context, id int64, mapping map[string]string) (adminapi.BulkUpdateResult, error) {
 	m.bulkCalls++

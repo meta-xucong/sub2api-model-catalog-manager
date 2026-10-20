@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"sub2api-model-catalog-manager/internal/modelversion"
 	"sub2api-model-catalog-manager/internal/state"
 )
 
@@ -36,8 +39,11 @@ type Input struct {
 	DirectoryHash                string
 	LifecycleScopes              []string
 	LifecycleExclusions          []LifecycleExclusion
+	ProductAvailabilityEnforced  bool
+	ProductAvailability          []ProductModelAvailability
 	RequireOfficialSelectability bool
 	OfficialSelectabilityScope   string
+	PruneMissingMappings         bool
 	Now                          time.Time
 }
 
@@ -56,6 +62,25 @@ type LifecycleExclusion struct {
 	OwnerRule     bool      `json:"owner_rule,omitempty"`
 }
 
+// ProductModelAvailability is bound into the approved plan so exact positive
+// product evidence, and the absence of such evidence, cannot change between
+// discovery and apply without changing the plan hash.
+type ProductModelAvailability struct {
+	ModelID             string    `json:"model_id"`
+	Provider            string    `json:"provider,omitempty"`
+	Status              string    `json:"status"`
+	MatchKind           string    `json:"match_kind"`
+	VersionFloorModelID string    `json:"version_floor_model_id,omitempty"`
+	SourceIDs           []string  `json:"source_ids,omitempty"`
+	SourceURLs          []string  `json:"source_urls,omitempty"`
+	ContentSHA256       []string  `json:"content_sha256,omitempty"`
+	RetrievedAt         time.Time `json:"retrieved_at,omitempty"`
+}
+
+var (
+	xAIVersionFloorModelID = regexp.MustCompile(`^grok-\d+\.\d+(?:-[a-z0-9][a-z0-9-]*)?$`)
+)
+
 type Change struct {
 	Action   string `json:"action"`
 	PublicID string `json:"public_id"`
@@ -67,37 +92,40 @@ type Change struct {
 }
 
 type Plan struct {
-	AccountID                       int64                `json:"account_id"`
-	Source                          Source               `json:"source"`
-	SourceFingerprint               string               `json:"source_fingerprint"`
-	BeforeHash                      string               `json:"before_mapping_hash"`
-	DirectoryHash                   string               `json:"directory_hash,omitempty"`
-	CatalogObservedAt               time.Time            `json:"catalog_observed_at"`
-	CompletenessProfileID           string               `json:"completeness_profile_id,omitempty"`
-	SourceIdentityAddPolicy         string               `json:"source_identity_add_policy"`
-	IdentityCatalogPolicy           string               `json:"identity_catalog_policy,omitempty"`
-	LifecycleScopes                 []string             `json:"lifecycle_scopes,omitempty"`
-	LifecycleExclusions             []LifecycleExclusion `json:"lifecycle_exclusions,omitempty"`
-	LifecycleEvidenceSHA256         string               `json:"lifecycle_evidence_sha256"`
-	OfficialSelectabilityScope      string               `json:"official_selectability_scope,omitempty"`
-	OfficialSelectabilitySHA256     string               `json:"official_selectability_sha256,omitempty"`
-	OfficialSelectabilityObservedAt time.Time            `json:"official_selectability_observed_at,omitempty"`
-	OfficialSelectabilityExpiresAt  time.Time            `json:"official_selectability_expires_at,omitempty"`
-	CatalogModels                   []string             `json:"catalog_models"`
-	CatalogWarningCodes             []string             `json:"catalog_warning_codes"`
-	ApplyEligible                   bool                 `json:"apply_eligible"`
-	DiscoveryReason                 string               `json:"discovery_reason,omitempty"`
-	RulesHash                       string               `json:"rules_hash"`
-	Completeness                    Completeness         `json:"catalog_completeness"`
-	LiveListAvailable               bool                 `json:"live_list_available"`
-	Before                          map[string]string    `json:"before_mapping"`
-	After                           map[string]string    `json:"after_mapping"`
-	Changes                         []Change             `json:"changes"`
-	Conflicts                       []string             `json:"conflicts"`
-	UnreviewedModels                []string             `json:"unreviewed_models"`
-	CreatedAt                       time.Time            `json:"created_at"`
-	AbsenceCountsBefore             map[string]int       `json:"absence_counts_before"`
-	AbsenceCountsAfter              map[string]int       `json:"absence_counts_after"`
+	AccountID                       int64                      `json:"account_id"`
+	Source                          Source                     `json:"source"`
+	SourceFingerprint               string                     `json:"source_fingerprint"`
+	BeforeHash                      string                     `json:"before_mapping_hash"`
+	DirectoryHash                   string                     `json:"directory_hash,omitempty"`
+	CatalogObservedAt               time.Time                  `json:"catalog_observed_at"`
+	CompletenessProfileID           string                     `json:"completeness_profile_id,omitempty"`
+	SourceIdentityAddPolicy         string                     `json:"source_identity_add_policy"`
+	IdentityCatalogPolicy           string                     `json:"identity_catalog_policy,omitempty"`
+	LifecycleScopes                 []string                   `json:"lifecycle_scopes,omitempty"`
+	LifecycleExclusions             []LifecycleExclusion       `json:"lifecycle_exclusions,omitempty"`
+	LifecycleEvidenceSHA256         string                     `json:"lifecycle_evidence_sha256"`
+	ProductAvailabilityEnforced     bool                       `json:"product_availability_enforced,omitempty"`
+	ProductAvailability             []ProductModelAvailability `json:"product_availability,omitempty"`
+	ProductAvailabilitySHA256       string                     `json:"product_availability_sha256,omitempty"`
+	OfficialSelectabilityScope      string                     `json:"official_selectability_scope,omitempty"`
+	OfficialSelectabilitySHA256     string                     `json:"official_selectability_sha256,omitempty"`
+	OfficialSelectabilityObservedAt time.Time                  `json:"official_selectability_observed_at,omitempty"`
+	OfficialSelectabilityExpiresAt  time.Time                  `json:"official_selectability_expires_at,omitempty"`
+	CatalogModels                   []string                   `json:"catalog_models"`
+	CatalogWarningCodes             []string                   `json:"catalog_warning_codes"`
+	ApplyEligible                   bool                       `json:"apply_eligible"`
+	DiscoveryReason                 string                     `json:"discovery_reason,omitempty"`
+	RulesHash                       string                     `json:"rules_hash"`
+	Completeness                    Completeness               `json:"catalog_completeness"`
+	LiveListAvailable               bool                       `json:"live_list_available"`
+	Before                          map[string]string          `json:"before_mapping"`
+	After                           map[string]string          `json:"after_mapping"`
+	Changes                         []Change                   `json:"changes"`
+	Conflicts                       []string                   `json:"conflicts"`
+	UnreviewedModels                []string                   `json:"unreviewed_models"`
+	CreatedAt                       time.Time                  `json:"created_at"`
+	AbsenceCountsBefore             map[string]int             `json:"absence_counts_before"`
+	AbsenceCountsAfter              map[string]int             `json:"absence_counts_after"`
 }
 
 func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
@@ -139,18 +167,20 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			}
 			return ""
 		}(),
-		LifecycleScopes:     append([]string{}, input.LifecycleScopes...),
-		LifecycleExclusions: append([]LifecycleExclusion{}, input.LifecycleExclusions...),
-		CatalogModels:       append([]string{}, input.LiveModels...),
-		CatalogWarningCodes: []string{},
-		ApplyEligible:       true,
-		Completeness:        input.Completeness,
-		LiveListAvailable:   input.LiveListAvailable,
-		Before:              cloneMapping(input.CurrentMapping),
-		After:               cloneMapping(input.CurrentMapping),
-		AbsenceCountsBefore: cloneAbsenceCounts(prior.AbsenceCounts),
-		AbsenceCountsAfter:  cloneAbsenceCounts(prior.AbsenceCounts),
-		Changes:             []Change{}, Conflicts: []string{}, UnreviewedModels: []string{},
+		LifecycleScopes:             append([]string{}, input.LifecycleScopes...),
+		LifecycleExclusions:         append([]LifecycleExclusion{}, input.LifecycleExclusions...),
+		ProductAvailabilityEnforced: input.ProductAvailabilityEnforced,
+		ProductAvailability:         cloneProductAvailability(input.ProductAvailability),
+		CatalogModels:               append([]string{}, input.LiveModels...),
+		CatalogWarningCodes:         []string{},
+		ApplyEligible:               true,
+		Completeness:                input.Completeness,
+		LiveListAvailable:           input.LiveListAvailable,
+		Before:                      cloneMapping(input.CurrentMapping),
+		After:                       cloneMapping(input.CurrentMapping),
+		AbsenceCountsBefore:         cloneAbsenceCounts(prior.AbsenceCounts),
+		AbsenceCountsAfter:          cloneAbsenceCounts(prior.AbsenceCounts),
+		Changes:                     []Change{}, Conflicts: []string{}, UnreviewedModels: []string{},
 		CreatedAt: time.Now().UTC(),
 	}
 	sort.Strings(plan.LifecycleScopes)
@@ -164,6 +194,15 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		return Plan{}, err
 	}
 	plan.LifecycleEvidenceSHA256 = lifecycleDigest
+	if input.ProductAvailabilityEnforced {
+		availabilityDigest, availabilityErr := ProductAvailabilityDigest(plan.ProductAvailability)
+		if availabilityErr != nil {
+			return Plan{}, availabilityErr
+		}
+		plan.ProductAvailabilitySHA256 = availabilityDigest
+	} else if len(plan.ProductAvailability) != 0 {
+		return Plan{}, errors.New("product availability evidence requires enforcement")
+	}
 	plan.BeforeHash, err = MappingHash(input.CurrentMapping)
 	if err != nil {
 		return Plan{}, err
@@ -239,6 +278,72 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		sort.Strings(plan.Conflicts)
 		return plan, nil
 	}
+	productStatus := make(map[string]string, len(plan.ProductAvailability))
+	probeStatus := make(map[string]string, len(plan.ProductAvailability))
+	for _, evidence := range plan.ProductAvailability {
+		if err := validateProductModelAvailability(evidence); err != nil {
+			return Plan{}, err
+		}
+		accountCatalogSource := ""
+		regionalCatalogSource := ""
+		for _, sourceID := range evidence.SourceIDs {
+			if sourceID == "volcengine-ark-account-models" {
+				accountCatalogSource = sourceID
+			}
+			if sourceID == "alibaba-model-studio-models" {
+				regionalCatalogSource = sourceID
+			}
+		}
+		if evidence.MatchKind == "official_account_absence" && accountCatalogSource == "" || evidence.MatchKind == "official_api_catalog_absence" && regionalCatalogSource == "" {
+			return Plan{}, errors.New("official catalog absence evidence is not bound to a recognized exact catalog")
+		}
+		if accountCatalogSource != "" || regionalCatalogSource != "" {
+			sourceID := accountCatalogSource
+			if sourceID == "" {
+				sourceID = regionalCatalogSource
+			}
+			expectedPlatform, expectedProvider, expectedURL := "", "", ""
+			switch sourceID {
+			case "volcengine-ark-account-models":
+				expectedPlatform, expectedProvider = "volcengine", "volcengine"
+				expectedURL = "https://ark.cn-beijing.volcengineapi.com/?Action=ListModelActivations&Version=2024-01-01"
+			case "alibaba-model-studio-models":
+				expectedPlatform, expectedProvider = "alibaba", "alibaba"
+				expectedURL = "https://ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com/api/v1/models?page_no=1&page_size=200"
+			}
+			if sourceID == "alibaba-model-studio-models" && !matchesBeijingModelStudioWorkspace(input.Source.BaseURL) {
+				return Plan{}, errors.New("official model availability evidence is outside the configured Alibaba workspace")
+			}
+			if input.Source.Platform != expectedPlatform || evidence.Provider != expectedProvider || len(evidence.SourceIDs) != 1 || evidence.SourceIDs[0] != sourceID || len(evidence.SourceURLs) != 1 || evidence.SourceURLs[0] != expectedURL {
+				return Plan{}, errors.New("official model availability evidence is not bound to its exact provider and source")
+			}
+		}
+		key := strings.ToLower(evidence.ModelID)
+		if _, duplicate := productStatus[key]; duplicate {
+			return Plan{}, errors.New("product availability contains duplicate model IDs")
+		}
+		if evidence.MatchKind == "account_probe_success" || evidence.MatchKind == "all_account_probes_failed" || evidence.MatchKind == "account_probe_ignored" {
+			// Probe conclusions apply only to the exact requested upstream ID.
+			// Keep the folded product status conservative so this evidence cannot
+			// authorize lifecycle, retired-catalog, or alias removal for a case
+			// variant of the candidate.
+			probeStatus[evidence.ModelID] = evidence.Status
+			productStatus[key] = "insufficient_evidence"
+		} else {
+			productStatus[key] = evidence.Status
+		}
+	}
+	productAvailable := func(modelID string) bool {
+		if status, found := probeStatus[modelID]; found {
+			return status == "available"
+		}
+		status, found := productStatus[strings.ToLower(modelID)]
+		return !input.ProductAvailabilityEnforced || !found || status == "available"
+	}
+	productEvidenceKnown := func(modelID string) bool {
+		_, found := productStatus[strings.ToLower(modelID)]
+		return input.ProductAvailabilityEnforced && found
+	}
 	managed := input.ManagedMappings
 	if managed == nil {
 		managed = prior.ManagedMappings
@@ -253,6 +358,109 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		}
 		current, exists := input.CurrentMapping[key]
 		return exists && current == owner.LastAppliedValue
+	}
+	if input.ProductAvailabilityEnforced {
+		unavailable := make(map[string]ProductModelAvailability)
+		probeUnavailable := make(map[string]ProductModelAvailability)
+		for _, evidence := range plan.ProductAvailability {
+			if evidence.Status == "unavailable" {
+				if evidence.MatchKind == "all_account_probes_failed" {
+					probeUnavailable[evidence.ModelID] = evidence
+				} else {
+					unavailable[strings.ToLower(evidence.ModelID)] = evidence
+				}
+			}
+		}
+		for modelID := range live {
+			if _, isUnavailable := probeUnavailable[modelID]; isUnavailable {
+				delete(live, modelID)
+			} else if _, isUnavailable := unavailable[strings.ToLower(modelID)]; isUnavailable {
+				delete(live, modelID)
+			}
+		}
+		removeKeys := make([]string, 0)
+		for publicID, upstreamID := range plan.After {
+			if IsWildcard(publicID) || IsWildcard(upstreamID) {
+				continue
+			}
+			availability, isUnavailable := probeUnavailable[upstreamID]
+			if !isUnavailable {
+				availability, isUnavailable = unavailable[strings.ToLower(upstreamID)]
+			}
+			if !isUnavailable {
+				continue
+			}
+			productUnionEvidence := authorizesUnmanagedProductRemoval(availability)
+			if !allowChanges(publicID) && !productUnionEvidence {
+				plan.ApplyEligible = false
+				plan.Conflicts = append(plan.Conflicts, "official product-availability evidence cannot remove an unmanaged or drifted mapping: "+publicID)
+				continue
+			}
+			removeKeys = append(removeKeys, publicID)
+		}
+		if len(plan.Conflicts) > 0 {
+			sort.Strings(plan.Conflicts)
+			plan.DiscoveryReason = "official product-availability evidence conflicts with an unmanaged or drifted mapping"
+			return plan, nil
+		}
+		sort.Strings(removeKeys)
+		for _, publicID := range removeKeys {
+			upstreamID := plan.After[publicID]
+			availability, isProbeUnavailable := probeUnavailable[upstreamID]
+			if !isProbeUnavailable {
+				availability = unavailable[strings.ToLower(upstreamID)]
+			}
+			delete(plan.After, publicID)
+			reason := "official evidence establishes that the model is unavailable across the accepted product union"
+			if availability.MatchKind == "all_account_probes_failed" {
+				reason = "exact-model inference failed on every relevant 404token account in the completed screening scope"
+			}
+			if availability.MatchKind == "accepted_union_version_floor" {
+				reason = "the model version is older than the lowest currently listed canonical version in the official product catalog"
+			}
+			if availability.MatchKind == "official_account_absence" || availability.MatchKind == "official_api_catalog_absence" {
+				switch availability.SourceIDs[0] {
+				case "volcengine-ark-account-models":
+					reason = "the official Ark inventory does not list this model as available for the configured Volcengine account"
+				case "alibaba-model-studio-models":
+					reason = "the official Beijing Model Studio API catalog does not list this model"
+				}
+			}
+			plan.Changes = append(plan.Changes, Change{
+				Action: "remove", PublicID: publicID, Before: upstreamID, RuleKind: "official_product_availability",
+				Evidence: strings.Join(availability.SourceIDs, ","),
+				Reason:   reason,
+			})
+		}
+	}
+	if input.PruneMissingMappings && liveUsable && selectable == nil {
+		keys := make([]string, 0, len(plan.After))
+		for publicID := range plan.After {
+			keys = append(keys, publicID)
+		}
+		sort.Strings(keys)
+		for _, publicID := range keys {
+			upstreamID := plan.After[publicID]
+			if IsWildcard(publicID) || IsWildcard(upstreamID) || live[upstreamID] {
+				continue
+			}
+			if !allowChanges(publicID) {
+				plan.ApplyEligible = false
+				plan.Conflicts = append(plan.Conflicts, "404token upstream catalog cannot remove an unmanaged or drifted mapping: "+publicID)
+				continue
+			}
+			delete(plan.After, publicID)
+			plan.Changes = append(plan.Changes, Change{
+				Action: "remove", PublicID: publicID, Before: upstreamID,
+				RuleKind: "live_catalog_absence", Evidence: "successful 404token native upstream catalog sync",
+				Reason: "exact upstream model ID is absent from the refreshed 404token model list",
+			})
+		}
+		if len(plan.Conflicts) > 0 {
+			sort.Strings(plan.Conflicts)
+			plan.DiscoveryReason = "404token upstream catalog conflicts with an unmanaged or drifted mapping"
+			return plan, nil
+		}
 	}
 	// The current official account selector is the sole retention authority.
 	// Upstream catalog visibility and static retirement/family rules cannot
@@ -313,16 +521,24 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		if !validProductLifecycleScope(exclusion.Scope) || !containsString(plan.LifecycleScopes, exclusion.Scope) || !validID(exclusion.ModelID) || !validLifecycleExclusion(exclusion) {
 			return Plan{}, errors.New("lifecycle exclusion is invalid or outside the approved product scope")
 		}
-		if previous, exists := excludedIDs[exclusion.ModelID]; exists && previous.Scope != exclusion.Scope {
+		if productEvidenceKnown(exclusion.ModelID) && productStatus[strings.ToLower(exclusion.ModelID)] != "unavailable" {
+			// Lifecycle evidence from one user-facing surface is report context
+			// unless the product-union evaluator establishes a negative result.
+			continue
+		}
+		key := strings.ToLower(exclusion.ModelID)
+		if previous, exists := excludedIDs[key]; exists && previous.Scope != exclusion.Scope {
 			return Plan{}, errors.New("lifecycle evidence assigns one model ID to multiple product scopes")
 		}
 		if selectable == nil {
-			excludedIDs[exclusion.ModelID] = exclusion
+			excludedIDs[key] = exclusion
 		}
 	}
 	if len(excludedIDs) > 0 {
-		for id := range excludedIDs {
-			delete(live, id)
+		for id := range live {
+			if _, excluded := excludedIDs[strings.ToLower(id)]; excluded {
+				delete(live, id)
+			}
 		}
 		keys := make([]string, 0, len(input.CurrentMapping))
 		for publicID := range input.CurrentMapping {
@@ -331,17 +547,23 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		sort.Strings(keys)
 		for _, publicID := range keys {
 			upstreamID := input.CurrentMapping[publicID]
-			exclusion, excluded := excludedIDs[upstreamID]
+			if _, remains := plan.After[publicID]; !remains {
+				continue
+			}
+			exclusion, excluded := excludedIDs[strings.ToLower(upstreamID)]
 			if !excluded {
 				continue
 			}
-			if !allowChanges(publicID) {
+			if !allowChanges(publicID) && publicID != upstreamID {
 				plan.ApplyEligible = false
 				plan.Conflicts = append(plan.Conflicts, "product lifecycle exclusion cannot remove an unmanaged or drifted mapping: "+publicID)
 				continue
 			}
 			delete(plan.After, publicID)
 			reason := "exact upstream ID is excluded by approved official product-scope evidence"
+			if publicID == upstreamID && !allowChanges(publicID) {
+				reason = "exact identity mapping is excluded by fresh official product-scope evidence"
+			}
 			if exclusion.OwnerRule {
 				reason = "exact upstream ID is excluded by an owner-confirmed product-scope availability decision"
 			}
@@ -421,13 +643,22 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				familyIDOwners[id] = family.PublicID
 			}
 			if !live[family.PreferredUpstreamID] {
-				// Selectability controls retention; upstream presence only controls
-				// whether a new/updated route can be materialized now.
-				if selectable == nil {
+				if input.ProductAvailabilityEnforced && productStatus[strings.ToLower(family.PreferredUpstreamID)] == "unavailable" {
+					continue // Product-union removal was handled before family reconciliation.
+				}
+				if selectable == nil && !input.PruneMissingMappings {
 					plan.ApplyEligible = false
 					plan.DiscoveryReason = "live identity sync conflicts with an unavailable family target"
 					plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
 				}
+				// A family target absent from the successful 404token catalog is
+				// unavailable for this source. Do not recreate it or block removal
+				// of an existing owned route; the live catalog is the authority here.
+				continue
+			}
+			if !productAvailable(family.PreferredUpstreamID) {
+				// A relay candidate without exact positive product evidence cannot
+				// add or update a canonical family mapping.
 				continue
 			}
 			if previous, exists := familyTargets[family.PublicID]; exists && previous.upstreamID != family.PreferredUpstreamID {
@@ -439,6 +670,11 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			familyCovered[family.PreferredUpstreamID] = true
 			familyCovered[family.PublicID] = true
 			for _, member := range family.Members {
+				if !productAvailable(member.UpstreamID) {
+					// Keep/hide actions affect concrete mappings, so require exact
+					// positive availability for that member as well.
+					continue
+				}
 				familyCovered[member.UpstreamID] = true
 				if member.ExactIDAction == "hide" {
 					if selectable != nil {
@@ -470,6 +706,12 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				plan.ApplyEligible = false
 				plan.Conflicts = append(plan.Conflicts, "version family canonical key is also hidden: "+publicID+" (family "+hiddenFamily+")")
 			}
+			if current, exists := input.CurrentMapping[publicID]; exists && current != target.upstreamID && input.ProductAvailabilityEnforced && !productAvailable(current) {
+				// Insufficient evidence for the existing target means preserve the
+				// current mapping; a new preferred target cannot overwrite it.
+				delete(familyTargets, publicID)
+				continue
+			}
 			if current, exists := input.CurrentMapping[publicID]; exists && current != target.upstreamID && !allowChanges(publicID) {
 				plan.ApplyEligible = false
 				plan.Conflicts = append(plan.Conflicts, "version family canonical key would overwrite an unmanaged or drifted mapping: "+publicID)
@@ -492,6 +734,11 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				continue
 			}
 			if selectable != nil {
+				continue
+			}
+			if productEvidenceKnown(rule.UpstreamID) && productStatus[strings.ToLower(rule.UpstreamID)] != "unavailable" {
+				// Static retirement rules cannot turn incomplete product evidence
+				// into a mapping deletion.
 				continue
 			}
 			// This branch only reconciles exact identity mappings. A retirement
@@ -539,6 +786,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			if !isExactIdentityMapping(publicID, upstreamID) {
 				continue
 			}
+			if _, remains := plan.After[publicID]; !remains {
+				continue // An earlier live-catalog or explicit-rule removal already handled this key.
+			}
 			if _, explicitlyHidden := hiddenMembers[publicID]; explicitlyHidden {
 				continue // Explicit hides are handled only through the ownership gate below.
 			}
@@ -546,6 +796,11 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 				continue // Keep the canonical key for the reviewed overlay below.
 			}
 			if selectable != nil && selectable[upstreamID] {
+				continue
+			}
+			if productEvidenceKnown(upstreamID) && productStatus[strings.ToLower(upstreamID)] != "unavailable" {
+				// Insufficient/positive product evidence preserves this mapping;
+				// relay-list omission alone does not authorize a deletion.
 				continue
 			}
 			if rule, explicitlyRetired := retired[publicID]; explicitlyRetired {
@@ -562,6 +817,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			plan.Changes = append(plan.Changes, Change{Action: "remove", PublicID: publicID, Before: upstreamID, RuleKind: "live_identity_sync", Evidence: "approved exact-source live catalog policy", Reason: "identity mapping is absent from the successful live upstream model list"})
 		}
 		for modelID := range live {
+			if productEvidenceKnown(modelID) && productStatus[strings.ToLower(modelID)] != "available" {
+				continue
+			}
 			if _, explicitlyHidden := hiddenMembers[modelID]; explicitlyHidden {
 				continue // Never identity-import an exact member reviewed as hidden.
 			}
@@ -641,7 +899,7 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		if !SourceMatches(rule.Source, input.Source) {
 			continue
 		}
-		if live[rule.UpstreamID] {
+		if live[rule.UpstreamID] && productAvailable(rule.UpstreamID) {
 			addDesired(rule.PublicID, rule.UpstreamID, "alias", rule.Evidence)
 		}
 	}
@@ -650,19 +908,28 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 			continue
 		}
 		if !live[family.PreferredUpstreamID] {
-			// The official selector determines eligibility. Gateway presence only
-			// gates whether this run can add or update a route.
-			if selectable == nil {
+			if input.ProductAvailabilityEnforced && productStatus[strings.ToLower(family.PreferredUpstreamID)] == "unavailable" {
+				continue // Authoritative product evidence already removed the unavailable exact target.
+			}
+			if selectable == nil && !input.PruneMissingMappings {
 				plan.Conflicts = append(plan.Conflicts, "version family preferred upstream ID is absent: "+family.PublicID)
 			}
 			continue
 		}
+		if !productAvailable(family.PreferredUpstreamID) {
+			// Product evidence is insufficient; preserve existing mappings and
+			// leave this canonical overlay untouched.
+			continue
+		}
 		addDesired(family.PublicID, family.PreferredUpstreamID, "version_family", family.Evidence)
 		for _, member := range family.Members {
-			if member.ExactIDAction == "keep" && live[member.UpstreamID] {
+			if member.ExactIDAction == "keep" && live[member.UpstreamID] && productAvailable(member.UpstreamID) {
 				addDesiredIfIdentityAbsent(plan.After, member.UpstreamID, member.UpstreamID, "version_family_keep", family.Evidence, &plan)
 			}
 			if member.ExactIDAction == "hide" {
+				if !productAvailable(member.UpstreamID) {
+					continue
+				}
 				if selectable != nil {
 					continue
 				}
@@ -682,8 +949,16 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		}
 	}
 	for public, item := range desired {
+		if !productAvailable(item.value) {
+			continue
+		}
 		if current, exists := plan.After[public]; exists {
 			if current == item.value {
+				continue
+			}
+			if input.ProductAvailabilityEnforced && !productAvailable(current) {
+				// Keep an existing mapping whose current target has insufficient
+				// official product evidence rather than replacing it speculatively.
 				continue
 			}
 			if !allowChanges(public) {
@@ -712,6 +987,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 		}
 		if current != rule.UpstreamID {
 			plan.Conflicts = append(plan.Conflicts, "retirement rule has no exact public-to-upstream mapping: "+rule.PublicID)
+			continue
+		}
+		if productEvidenceKnown(current) && productStatus[strings.ToLower(current)] != "unavailable" {
 			continue
 		}
 		if !allowChanges(rule.PublicID) {
@@ -749,6 +1027,9 @@ func Normalize(rules Rules, input Input, prior state.Account) (Plan, error) {
 	}
 	if input.Completeness == CompletenessComplete && input.SourceIdentityAddPolicy == "add_exact" {
 		for id := range live {
+			if productEvidenceKnown(id) && productStatus[strings.ToLower(id)] != "available" {
+				continue
+			}
 			if known[id] {
 				continue
 			}
@@ -835,6 +1116,14 @@ func addDesiredIfIdentityAbsent(after map[string]string, key, value, kind, evide
 	plan.Changes = append(plan.Changes, Change{Action: "add", PublicID: key, After: value, RuleKind: kind, Evidence: evidence, Reason: "reviewed family member explicitly marked keep"})
 }
 
+func matchesBeijingModelStudioWorkspace(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || !strings.EqualFold(parsed.Hostname(), "ws-soph8gi8iynvs7lh.cn-beijing.maas.aliyuncs.com") {
+		return false
+	}
+	return parsed.Port() == "" || parsed.Port() == "443"
+}
+
 func SourceFingerprint(s Source) string {
 	normalized, _ := NormalizeBaseURL(s.BaseURL)
 	s.BaseURL = normalized
@@ -878,6 +1167,113 @@ func LifecycleEvidenceDigest(scopes []string, exclusions []LifecycleExclusion) (
 	}{Scopes: orderedScopes, Exclusions: orderedExclusions})
 }
 
+func ProductAvailabilityDigest(items []ProductModelAvailability) (string, error) {
+	ordered := cloneProductAvailability(items)
+	sort.Slice(ordered, func(i, j int) bool { return strings.ToLower(ordered[i].ModelID) < strings.ToLower(ordered[j].ModelID) })
+	for i := range ordered {
+		sort.Strings(ordered[i].SourceIDs)
+		sort.Strings(ordered[i].SourceURLs)
+		sort.Strings(ordered[i].ContentSHA256)
+		if i > 0 && strings.EqualFold(ordered[i-1].ModelID, ordered[i].ModelID) {
+			return "", errors.New("product availability contains duplicate model IDs")
+		}
+		if err := validateProductModelAvailability(ordered[i]); err != nil {
+			return "", err
+		}
+	}
+	return canonicalHash(ordered)
+}
+
+func cloneProductAvailability(items []ProductModelAvailability) []ProductModelAvailability {
+	out := append([]ProductModelAvailability{}, items...)
+	for i := range out {
+		out[i].SourceIDs = append([]string(nil), items[i].SourceIDs...)
+		out[i].SourceURLs = append([]string(nil), items[i].SourceURLs...)
+		out[i].ContentSHA256 = append([]string(nil), items[i].ContentSHA256...)
+	}
+	return out
+}
+
+func validateProductModelAvailability(item ProductModelAvailability) error {
+	if !validID(item.ModelID) {
+		return errors.New("product availability contains an invalid model ID")
+	}
+	if item.Status != "available" && item.Status != "unavailable" && item.Status != "insufficient_evidence" {
+		return errors.New("product availability contains an invalid status")
+	}
+	if item.MatchKind != "exact" && item.MatchKind != "explicit_alias" && item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "account_probe_success" && item.MatchKind != "all_account_probes_failed" && item.MatchKind != "account_probe_ignored" && item.MatchKind != "lower_than_unavailable_version" && item.MatchKind != "none" {
+		return errors.New("product availability contains an invalid match kind")
+	}
+	if item.Status == "available" {
+		if item.MatchKind != "exact" && item.MatchKind != "explicit_alias" && item.MatchKind != "account_probe_success" || len(item.SourceIDs) == 0 || len(item.SourceURLs) == 0 || len(item.ContentSHA256) == 0 || item.RetrievedAt.IsZero() {
+			return errors.New("positive product availability is missing exact source evidence")
+		}
+	} else if item.Status == "unavailable" {
+		if item.MatchKind != "accepted_union_absence" && item.MatchKind != "accepted_union_retirement" && item.MatchKind != "accepted_union_version_floor" && item.MatchKind != "official_account_absence" && item.MatchKind != "official_api_catalog_absence" && item.MatchKind != "all_account_probes_failed" && item.MatchKind != "lower_than_unavailable_version" || len(item.SourceIDs) == 0 || len(item.SourceURLs) == 0 || len(item.ContentSHA256) == 0 || item.RetrievedAt.IsZero() {
+			return errors.New("negative product availability is missing complete-scope evidence")
+		}
+	} else if item.MatchKind != "none" && item.MatchKind != "account_probe_ignored" {
+		return errors.New("insufficient product availability cannot claim a model match")
+	}
+	if item.MatchKind == "account_probe_success" || item.MatchKind == "all_account_probes_failed" || item.MatchKind == "account_probe_ignored" {
+		if len(item.SourceIDs) != 1 || item.SourceIDs[0] != "404token-account-probe-v1" || len(item.SourceURLs) != 1 || item.SourceURLs[0] != "https://404token.xyz/api/v1/admin/accounts/{account_id}/test" || len(item.ContentSHA256) != 1 {
+			return errors.New("account probe evidence is not bound to the approved probe contract")
+		}
+	}
+	if len(item.SourceIDs) != len(item.SourceURLs) || len(item.SourceIDs) != len(item.ContentSHA256) {
+		return errors.New("product availability source metadata lengths differ")
+	}
+	if item.MatchKind == "accepted_union_version_floor" {
+		if len(item.SourceIDs) != 1 || len(item.SourceURLs) != 1 || len(item.ContentSHA256) != 1 {
+			return errors.New("version-floor evidence must identify exactly one approved official catalog")
+		}
+		switch {
+		case item.Provider == "xai" && item.SourceIDs[0] == "xai-grok-web-models" && item.SourceURLs[0] == "https://x.ai/news/grok-4-5-everywhere" && xAIVersionFloorModelID.MatchString(strings.ToLower(item.ModelID)):
+		default:
+			return errors.New("version-floor evidence is not bound to an approved provider catalog")
+		}
+	}
+	if item.MatchKind == "accepted_union_retirement" {
+		if len(item.SourceIDs) != 1 || len(item.SourceURLs) != 1 || len(item.ContentSHA256) != 1 ||
+			item.Provider != "openai" || item.SourceIDs[0] != "openai-cross-product-lifecycle-v2" ||
+			item.SourceURLs[0] != "https://learn.chatgpt.com/docs/changelog" || !strings.HasPrefix(strings.ToLower(item.ModelID), "gpt-") {
+			return errors.New("product retirement evidence is not bound to the approved OpenAI cross-product lifecycle source")
+		}
+	}
+	if item.MatchKind == "lower_than_unavailable_version" {
+		if item.VersionFloorModelID == "" || item.ModelID == item.VersionFloorModelID || !modelversion.AtOrBelowVersion(item.ModelID, item.VersionFloorModelID) || !validVersionFloorSource(item) {
+			return errors.New("cascaded version-floor evidence does not identify an equal-or-lower model relative to its unavailable trigger")
+		}
+	} else if item.VersionFloorModelID != "" {
+		return errors.New("version-floor trigger is only valid for cascaded unavailability")
+	}
+	for i, sourceID := range item.SourceIDs {
+		if strings.TrimSpace(sourceID) == "" || !strings.HasPrefix(item.SourceURLs[i], "https://") || !validSHA256(item.ContentSHA256[i]) || (i > 0 && item.SourceIDs[i-1] >= sourceID) {
+			return errors.New("product availability source metadata is invalid or not canonical")
+		}
+	}
+	for i := 1; i < len(item.SourceURLs); i++ {
+		if item.SourceURLs[i-1] >= item.SourceURLs[i] {
+			return errors.New("product availability source URLs are not canonical")
+		}
+	}
+	for i := 1; i < len(item.ContentSHA256); i++ {
+		if item.ContentSHA256[i-1] >= item.ContentSHA256[i] {
+			return errors.New("product availability hashes are not canonical")
+		}
+	}
+	return nil
+}
+
+func authorizesUnmanagedProductRemoval(item ProductModelAvailability) bool {
+	switch item.MatchKind {
+	case "accepted_union_version_floor", "accepted_union_retirement", "all_account_probes_failed", "lower_than_unavailable_version":
+		return validateProductModelAvailability(item) == nil
+	default:
+		return false
+	}
+}
+
 func validLifecycleExclusion(exclusion LifecycleExclusion) bool {
 	if !validProductLifecycleScope(exclusion.Scope) || !validID(exclusion.ModelID) || len(exclusion.Excerpt) > 360 {
 		return false
@@ -885,7 +1281,13 @@ func validLifecycleExclusion(exclusion LifecycleExclusion) bool {
 	if exclusion.OwnerRule {
 		return exclusion.Status == "owner_confirmed_unavailable" && exclusion.SourceID == "" && exclusion.SourceURL == "" && exclusion.ContentSHA256 == "" && exclusion.RetrievedAt.IsZero()
 	}
-	if exclusion.Status != "retired" && exclusion.Status != "retired_with_compatibility_route" && exclusion.Status != "announced_deprecated" {
+	if exclusion.Status != "not_listed" && exclusion.Status != "deprecated" && exclusion.Status != "retired" && exclusion.Status != "retired_with_compatibility_route" && exclusion.Status != "announced_deprecated" {
+		return false
+	}
+	if !officialLifecycleModelIDMatchesScope(exclusion.Scope, exclusion.ModelID) {
+		return false
+	}
+	if exclusion.Status == "not_listed" && exclusion.Scope == "openai_codex_chatgpt_login" && !strings.HasPrefix(strings.ToLower(exclusion.ModelID), "gpt-") {
 		return false
 	}
 	if exclusion.SourceID == "" || !strings.HasPrefix(exclusion.SourceURL, "https://") || !validSHA256(exclusion.ContentSHA256) || exclusion.RetrievedAt.IsZero() {
@@ -897,11 +1299,31 @@ func validLifecycleExclusion(exclusion LifecycleExclusion) bool {
 	return exclusion.Status != "announced_deprecated" || exclusion.EffectiveAt != ""
 }
 
+func officialLifecycleModelIDMatchesScope(scope, modelID string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	switch scope {
+	case "openai_codex_chatgpt_login":
+		return strings.HasPrefix(modelID, "gpt-")
+	case "anthropic_claude_code_login":
+		return strings.HasPrefix(modelID, "claude-")
+	case "kimi_code_login":
+		if strings.HasPrefix(modelID, "kimi-") {
+			return true
+		}
+		return regexp.MustCompile(`^k[0-9]+(?:-[0-9]+k)?$`).MatchString(modelID)
+	default:
+		return false
+	}
+}
+
 func lifecycleEvidenceLabel(exclusion LifecycleExclusion) string {
 	if exclusion.OwnerRule {
 		return "owner-confirmed unavailable in " + exclusion.Scope
 	}
 	label := exclusion.Scope + "; " + exclusion.SourceID + "; " + exclusion.SourceURL
+	if exclusion.Status == "not_listed" {
+		label += "; absent from current official product model list"
+	}
 	if exclusion.EffectiveAt != "" {
 		label += "; effective=" + exclusion.EffectiveAt
 	}

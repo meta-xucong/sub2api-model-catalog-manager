@@ -69,13 +69,21 @@ type Mapping struct {
 }
 
 type DiscoveryAccount struct {
-	ID                int64           `json:"account_id"`
-	SourceFingerprint string          `json:"source_fingerprint"`
-	Status            string          `json:"status"`
-	LiveListAvailable bool            `json:"live_list_available"`
-	Models            []string        `json:"models"`
-	Changes           []MappingChange `json:"proposed_changes"`
-	Conflicts         []string        `json:"conflicts"`
+	ID                  int64                         `json:"account_id"`
+	SourceFingerprint   string                        `json:"source_fingerprint"`
+	Status              string                        `json:"status"`
+	LiveListAvailable   bool                          `json:"live_list_available"`
+	Models              []string                      `json:"models"`
+	ProductAvailability []ProductAvailabilityEvidence `json:"product_availability"`
+	Changes             []MappingChange               `json:"proposed_changes"`
+	Conflicts           []string                      `json:"conflicts"`
+}
+
+type ProductAvailabilityEvidence struct {
+	ModelID   string `json:"model_id"`
+	Provider  string `json:"provider,omitempty"`
+	Status    string `json:"status"`
+	MatchKind string `json:"match_kind"`
 }
 
 type MappingChange struct {
@@ -118,17 +126,41 @@ type Summary struct {
 	CandidatesWithPartialRule       int `json:"candidates_with_partial_family_rule"`
 	CandidatesWithCompleteRule      int `json:"candidates_with_complete_family_rule"`
 	CandidatesWithUnmanagedMappings int `json:"candidates_with_unmanaged_or_drifted_hide_targets"`
+	NameMergeCandidates             int `json:"name_merge_candidates"`
+	NameMergeSkippedModels          int `json:"name_merge_skipped_models"`
 }
 
 type AccountReview struct {
-	AccountID           int64             `json:"account_id"`
-	SourceFingerprint   string            `json:"source_fingerprint"`
-	DiscoveryStatus     string            `json:"discovery_status"`
-	LiveModelCount      int               `json:"live_model_count"`
-	MatchingAliasRules  int               `json:"source_scoped_alias_rules"`
-	MatchingFamilyRules int               `json:"source_scoped_version_family_rules"`
-	DateFamilies        []FamilyCandidate `json:"date_family_candidates"`
-	ExcludedReason      string            `json:"excluded_reason,omitempty"`
+	AccountID           int64                `json:"account_id"`
+	SourceFingerprint   string               `json:"source_fingerprint"`
+	DiscoveryStatus     string               `json:"discovery_status"`
+	LiveModelCount      int                  `json:"live_model_count"`
+	MatchingAliasRules  int                  `json:"source_scoped_alias_rules"`
+	MatchingFamilyRules int                  `json:"source_scoped_version_family_rules"`
+	DateFamilies        []FamilyCandidate    `json:"date_family_candidates"`
+	NameMergeCandidates []NameMergeCandidate `json:"name_merge_candidates"`
+	NameMergeSkips      []NameMergeSkip      `json:"name_merge_skips"`
+	ExcludedReason      string               `json:"excluded_reason,omitempty"`
+}
+
+type NameMergeCandidate struct {
+	CandidateID         string             `json:"candidate_id"`
+	NormalizedKey       string             `json:"normalized_key"`
+	Provider            string             `json:"provider,omitempty"`
+	Members             []Member           `json:"members"`
+	Action              string             `json:"action"`
+	DecisionRequired    bool               `json:"decision_required"`
+	Equivalence         string             `json:"equivalence"`
+	SkipReason          string             `json:"skip_reason,omitempty"`
+	MatchingAliasRules  int                `json:"matching_alias_rules"`
+	MatchingFamilyRules int                `json:"matching_family_rules"`
+	RuleConflict        bool               `json:"explicit_rule_conflict"`
+	RelatedMappings     []MappingOwnership `json:"related_mappings"`
+}
+
+type NameMergeSkip struct {
+	ModelID string `json:"model_id"`
+	Reason  string `json:"reason"`
 }
 
 type FamilyCandidate struct {
@@ -236,10 +268,12 @@ func Build(inspect, discover InputReport, rules catalog.Rules, rulesHash string,
 			return Report{}, fmt.Errorf("account %d mapping snapshot is invalid", accountID)
 		}
 		row := AccountReview{
-			AccountID:         accountID,
-			SourceFingerprint: account.SourceFingerprint,
-			DiscoveryStatus:   safeStatus(discovery.Status),
-			DateFamilies:      []FamilyCandidate{},
+			AccountID:           accountID,
+			SourceFingerprint:   account.SourceFingerprint,
+			DiscoveryStatus:     safeStatus(discovery.Status),
+			DateFamilies:        []FamilyCandidate{},
+			NameMergeCandidates: []NameMergeCandidate{},
+			NameMergeSkips:      []NameMergeSkip{},
 		}
 		row.MatchingAliasRules = matchingAliasRules(rules, source)
 		row.MatchingFamilyRules = matchingFamilyRules(rules, source)
@@ -251,9 +285,27 @@ func Build(inspect, discover InputReport, rules catalog.Rules, rulesHash string,
 		if err := validateModelList(discovery.Models); err != nil {
 			return Report{}, fmt.Errorf("account %d live model list is invalid", accountID)
 		}
+		availability, err := availabilityByExactModel(discovery.ProductAvailability)
+		if err != nil {
+			return Report{}, fmt.Errorf("account %d product availability is invalid", accountID)
+		}
 		row.LiveModelCount = len(uniqueSorted(discovery.Models))
 		out.Summary.AccountsWithLiveCatalog++
-		candidates := findDateFamilies(accountID, account.SourceFingerprint, source, discovery.Models, account.Mappings, discovery.Changes, discovery.Conflicts, rules, local)
+		availableModels := make([]string, 0, len(discovery.Models))
+		for _, modelID := range uniqueSorted(discovery.Models) {
+			if availabilityAvailable(availability, modelID) {
+				availableModels = append(availableModels, modelID)
+				if _, normalizable := normalizeReviewName(modelID); !normalizable {
+					row.NameMergeSkips = append(row.NameMergeSkips, NameMergeSkip{ModelID: modelID, Reason: "unsupported_characters_for_safe_name_normalization"})
+				}
+			} else {
+				row.NameMergeSkips = append(row.NameMergeSkips, NameMergeSkip{ModelID: modelID, Reason: availabilitySkipReason(availability, modelID)})
+			}
+		}
+		candidates := findDateFamilies(accountID, account.SourceFingerprint, source, availableModels, account.Mappings, discovery.Changes, discovery.Conflicts, rules, local)
+		row.NameMergeCandidates = findNormalizedNameCandidates(accountID, account.SourceFingerprint, source, availableModels, account.Mappings, rules, local)
+		out.Summary.NameMergeCandidates += len(row.NameMergeCandidates)
+		out.Summary.NameMergeSkippedModels += len(row.NameMergeSkips)
 		for i := range candidates {
 			candidate := &candidates[i]
 			switch candidate.FamilyRuleCoverage {
@@ -535,6 +587,173 @@ func findDateFamilies(accountID int64, fingerprint string, source catalog.Source
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].PublicIDCandidate < result[j].PublicIDCandidate })
 	return result
+}
+
+func availabilityByExactModel(items []ProductAvailabilityEvidence) (map[string]ProductAvailabilityEvidence, error) {
+	result := make(map[string]ProductAvailabilityEvidence, len(items))
+	for _, item := range items {
+		if item.ModelID == "" || item.Provider != strings.TrimSpace(item.Provider) || item.MatchKind == "" || item.Status != "available" && item.Status != "unavailable" && item.Status != "insufficient_evidence" {
+			return nil, errors.New("invalid exact model status")
+		}
+		if item.Provider == "" {
+			// Probe outcomes are attached to the originating product record, which
+			// can have no classified provider. They remain valid report evidence,
+			// but availabilityAvailable still requires a provider and an official
+			// exact/explicit-alias match, so they can only be reported as skips.
+			probeStatusMatches := item.MatchKind == "account_probe_success" && item.Status == "available" ||
+				item.MatchKind == "all_account_probes_failed" && item.Status == "unavailable" ||
+				item.MatchKind == "account_probe_ignored" && item.Status == "insufficient_evidence"
+			if !probeStatusMatches {
+				return nil, errors.New("invalid exact model status")
+			}
+		}
+		if _, exists := result[item.ModelID]; exists {
+			return nil, errors.New("duplicate exact model status")
+		}
+		result[item.ModelID] = item
+	}
+	return result, nil
+}
+
+func availabilityAvailable(items map[string]ProductAvailabilityEvidence, modelID string) bool {
+	item, ok := items[modelID]
+	return ok && item.ModelID == modelID && item.Provider != "" && item.Status == "available" && (item.MatchKind == "exact" || item.MatchKind == "explicit_alias")
+}
+
+func availabilitySkipReason(items map[string]ProductAvailabilityEvidence, modelID string) string {
+	item, ok := items[modelID]
+	if !ok {
+		return "missing_exact_product_availability_evidence"
+	}
+	if item.ModelID != modelID {
+		return "availability_evidence_model_id_mismatch"
+	}
+	if item.Status == "available" && item.MatchKind == "account_probe_success" {
+		return "account_probe_success_is_not_official_product_evidence"
+	}
+	switch item.Status {
+	case "unavailable":
+		return "exact_model_screened_unavailable"
+	case "insufficient_evidence":
+		return "exact_model_screening_insufficient_evidence"
+	default:
+		return "availability_match_kind_not_approved_for_merge_review"
+	}
+}
+
+// normalizeReviewName changes only ASCII case and underscore separators.
+// Versions, dates, regions, capabilities, quantization and all other suffixes
+// remain intact so they cannot be mistaken for spelling variants.
+func normalizeReviewName(value string) (string, bool) {
+	if value == "" {
+		return "", false
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		if r > 127 || !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return "", false
+		}
+		if r == '_' {
+			b.WriteByte('-')
+		} else if r >= 'A' && r <= 'Z' {
+			b.WriteByte(byte(r + ('a' - 'A')))
+		} else {
+			b.WriteByte(byte(r))
+		}
+	}
+	return b.String(), true
+}
+
+func findNormalizedNameCandidates(accountID int64, fingerprint string, source catalog.Source, models []string, mappings []Mapping, rules catalog.Rules, local state.State) []NameMergeCandidate {
+	groups := map[string][]string{}
+	for _, modelID := range uniqueSorted(models) {
+		key, ok := normalizeReviewName(modelID)
+		if !ok {
+			continue
+		}
+		groups[key] = append(groups[key], modelID)
+	}
+	keys := make([]string, 0, len(groups))
+	for key, members := range groups {
+		if len(members) > 1 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]NameMergeCandidate, 0, len(keys))
+	for _, key := range keys {
+		members := groups[key]
+		candidate := NameMergeCandidate{NormalizedKey: key, Action: "none", DecisionRequired: true, Equivalence: "unproven", SkipReason: "manual_review_required", Members: make([]Member, 0, len(members)), RelatedMappings: []MappingOwnership{}}
+		for _, modelID := range members {
+			candidate.Members = append(candidate.Members, Member{UpstreamID: modelID})
+		}
+		matchingAliases := 0
+		aliasMembers := map[string]bool{}
+		aliasTargets := map[string]bool{}
+		for _, alias := range rules.Aliases {
+			if !catalog.SourceMatches(alias.Source, source) || !contains(members, alias.UpstreamID) {
+				continue
+			}
+			matchingAliases++
+			aliasMembers[alias.UpstreamID] = true
+			aliasTargets[alias.PublicID] = true
+		}
+		candidate.MatchingAliasRules = matchingAliases
+		matchingFamilies := 0
+		familyMembers := map[string]bool{}
+		familyPublicIDs := map[string]bool{}
+		for _, family := range matchingFamiliesForSource(rules, source) {
+			matched := false
+			for _, member := range family.Members {
+				if contains(members, member.UpstreamID) {
+					matched = true
+					familyMembers[member.UpstreamID] = true
+				}
+			}
+			if matched {
+				matchingFamilies++
+				familyPublicIDs[family.PublicID] = true
+			}
+		}
+		candidate.MatchingFamilyRules = matchingFamilies
+		candidate.RuleConflict = (len(aliasMembers) > 0 && len(aliasMembers) < len(members)) ||
+			(len(familyMembers) > 0 && len(familyMembers) < len(members)) || len(aliasTargets) > 1 || len(familyPublicIDs) > 1
+		if candidate.RuleConflict {
+			candidate.SkipReason = "explicit_rules_conflict_with_candidate"
+		} else if len(aliasMembers) == len(members) && len(members) > 0 || len(familyMembers) == len(members) && len(members) > 0 {
+			candidate.SkipReason = "existing_explicit_rules_are_authoritative"
+		}
+		mappingIDs := map[string]bool{}
+		for _, modelID := range members {
+			mappingIDs[modelID] = true
+		}
+		for _, mapping := range mappings {
+			if !mappingIDs[mapping.PublicID] && !mappingIDs[mapping.UpstreamID] {
+				continue
+			}
+			ownership := "unmanaged"
+			if account, ok := local.Accounts[strconv.FormatInt(accountID, 10)]; ok {
+				if owner, found := account.ManagedMappings[mapping.PublicID]; found {
+					if owner.SourceFingerprint == fingerprint && owner.LastAppliedValue == mapping.UpstreamID {
+						ownership = "managed"
+					} else {
+						ownership = "drifted"
+					}
+				}
+			}
+			candidate.RelatedMappings = append(candidate.RelatedMappings, MappingOwnership{PublicID: mapping.PublicID, UpstreamID: mapping.UpstreamID, Ownership: ownership, Identity: mapping.PublicID == mapping.UpstreamID})
+		}
+		sort.Slice(candidate.RelatedMappings, func(i, j int) bool {
+			if candidate.RelatedMappings[i].PublicID != candidate.RelatedMappings[j].PublicID {
+				return candidate.RelatedMappings[i].PublicID < candidate.RelatedMappings[j].PublicID
+			}
+			return candidate.RelatedMappings[i].UpstreamID < candidate.RelatedMappings[j].UpstreamID
+		})
+		candidate.CandidateID = makeCandidateID(accountID, fingerprint, key, members)
+		out = append(out, candidate)
+	}
+	return out
 }
 
 func validateMappingSnapshot(account InspectAccount) error {

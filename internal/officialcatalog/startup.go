@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,7 @@ import (
 	"time"
 )
 
-const cacheVersion = 3
+const cacheVersion = 6
 
 type diskSnapshot struct {
 	Version  int             `json:"version"`
@@ -113,13 +114,53 @@ func SyncStartup(ctx context.Context, options StartupSyncOptions) StartupSyncRes
 
 func syncOneSource(ctx context.Context, spec sourceSpec, options StartupSyncOptions, doer HTTPDoer, budget *requestBudget) ProviderSync {
 	started := options.Now().UTC()
+	var arkCreds *arkCredentials
+	var modelStudioAPIKey string
+	if spec.adapter == "volcengine_ark" {
+		credentialFile := options.ArkCredentialFile
+		if credentialFile == "" {
+			lookup := options.LookupEnv
+			if lookup == nil {
+				lookup = os.LookupEnv
+			}
+			credentialFile, _ = lookup("VOLCENGINE_ARK_CREDENTIAL_FILE")
+		}
+		if strings.TrimSpace(credentialFile) == "" {
+			return statusFromError(spec, nil, "credential_not_configured")
+		}
+		credentials, err := loadArkCredentials(credentialFile)
+		if err != nil {
+			return statusFromError(spec, nil, err.Error())
+		}
+		defer zero(credentials.secretKey)
+		accountHash := sha256.Sum256([]byte(credentials.accessKeyID))
+		spec.cacheScope = hex.EncodeToString(accountHash[:])
+		arkCreds = &credentials
+	} else if spec.adapter == "alibaba_model_studio" {
+		lookup := options.LookupEnv
+		if lookup == nil {
+			lookup = os.LookupEnv
+		}
+		var credentialErr error
+		modelStudioAPIKey, credentialErr = modelStudioAPIKeyFromEnv(lookup)
+		if credentialErr != nil {
+			err := credentialErr
+			return statusFromError(spec, nil, err.Error())
+		}
+		accountHash := sha256.Sum256([]byte(modelStudioAPIKey))
+		spec.cacheScope = hex.EncodeToString(accountHash[:])
+	}
 	lockFn := options.acquireScopeLock
 	if lockFn == nil {
 		lockFn = acquireOSLock
 	}
 	lockCtx, cancel := context.WithTimeout(ctx, StartupSyncTimeout)
 	defer cancel()
-	lockPath := filepath.Join(options.CacheDir, spec.id, "sync.lock")
+	cacheDir := sourceCacheDir(options.CacheDir, spec)
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		return failureWithLastGood(spec, options, "private_cache_unavailable")
+	}
+	lockPath := filepath.Join(cacheDir, "sync.lock")
 	if err := securePrivateDir(filepath.Dir(lockPath)); err != nil && !os.IsNotExist(err) {
 		return failureWithLastGood(spec, options, "private_cache_unavailable")
 	}
@@ -150,7 +191,15 @@ func syncOneSource(ctx context.Context, spec sourceSpec, options StartupSyncOpti
 	if prior.Complete {
 		priorPtr = &prior
 	}
-	snapshot, fetchErr := fetchSource(ctx, spec, priorPtr, doer, budget, options.Now)
+	var snapshot CatalogSnapshot
+	var fetchErr error
+	if spec.adapter == "volcengine_ark" {
+		snapshot, fetchErr = fetchArkCatalog(ctx, spec, *arkCreds, doer, options.Now)
+	} else if spec.adapter == "alibaba_model_studio" {
+		snapshot, fetchErr = fetchAlibabaModelStudioCatalog(ctx, spec, modelStudioAPIKey, doer, budget, options.Now)
+	} else {
+		snapshot, fetchErr = fetchSource(ctx, spec, priorPtr, doer, budget, options.Now)
+	}
 	if fetchErr != nil {
 		return statusFromError(spec, priorPtr, failureCode(fetchErr))
 	}
@@ -165,6 +214,56 @@ func syncOneSource(ctx context.Context, spec sourceSpec, options StartupSyncOpti
 		return ProviderSync{SourceID: spec.id, Provider: spec.provider, Scope: spec.scope, Status: status, ErrorCode: "private_cache_write_failed", FetchedAt: timePtr(snapshot.FetchedAt), CheckedAt: timePtr(snapshot.CheckedAt), EvidenceCount: len(snapshot.Evidence), Snapshot: &snapshot, SourceURL: spec.rootURL, Limitation: spec.limitation}
 	}
 	return providerSyncFromSnapshot(spec, snapshot, true, false, status)
+}
+
+func modelStudioAPIKeyFromEnv(lookup func(string) (string, bool)) (string, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	if key, ok := lookup("DASHSCOPE_API_KEY"); ok && key != "" {
+		if err := validateModelStudioAPIKey(key); err != nil {
+			return "", err
+		}
+		return key, nil
+	}
+	path, _ := lookup("DASHSCOPE_API_KEY_FILE")
+	credentialDir, _ := lookup("CREDENTIALS_DIRECTORY")
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(credentialDir) == "" {
+		return "", errors.New("credential_not_configured")
+	}
+	credentialDir, err := filepath.Abs(credentialDir)
+	if err != nil {
+		return "", errors.New("credential_file_unavailable")
+	}
+	expectedPath := filepath.Join(credentialDir, "dashscope-api-key")
+	path, err = filepath.Abs(path)
+	if err != nil || filepath.Clean(path) != expectedPath {
+		return "", errors.New("credential_file_unavailable")
+	}
+	linkInfo, err := os.Lstat(path)
+	if err != nil || !linkInfo.Mode().IsRegular() || linkInfo.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("credential_file_unavailable")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", errors.New("credential_file_unavailable")
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Size() <= 0 || openedInfo.Size() > maxModelStudioAPIKey || !os.SameFile(linkInfo, openedInfo) {
+		return "", errors.New("credential_file_unavailable")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxModelStudioAPIKey+1))
+	if err != nil || len(body) == 0 || len(body) > maxModelStudioAPIKey {
+		zero(body)
+		return "", errors.New("credential_file_unavailable")
+	}
+	defer zero(body)
+	key := strings.TrimSpace(string(body))
+	if err := validateModelStudioAPIKey(key); err != nil {
+		return "", err
+	}
+	return key, nil
 }
 
 func providerSyncFromSnapshot(spec sourceSpec, snapshot CatalogSnapshot, persisted, coalesced bool, status string) ProviderSync {
@@ -254,7 +353,7 @@ func readSourceSnapshot(root string, spec sourceSpec) (CatalogSnapshot, error) {
 	if root == "" {
 		return CatalogSnapshot{}, errors.New("cache unavailable")
 	}
-	dir := filepath.Join(root, spec.id)
+	dir := sourceCacheDir(root, spec)
 	if err := securePrivateDir(dir); err != nil {
 		return CatalogSnapshot{}, err
 	}
@@ -293,7 +392,7 @@ func writeSourceSnapshot(root string, spec sourceSpec, snapshot CatalogSnapshot)
 	if root == "" || validateSnapshot(spec, snapshot) != nil {
 		return errors.New("invalid source snapshot")
 	}
-	dir := filepath.Join(root, spec.id)
+	dir := sourceCacheDir(root, spec)
 	if err := securePrivateDir(dir); err != nil {
 		return err
 	}
@@ -332,6 +431,14 @@ func writeSourceSnapshot(root string, spec sourceSpec, snapshot CatalogSnapshot)
 	return securePrivateFile(filepath.Join(dir, "snapshot.json"))
 }
 
+func sourceCacheDir(root string, spec sourceSpec) string {
+	dir := filepath.Join(root, spec.id)
+	if spec.cacheScope != "" {
+		dir = filepath.Join(dir, spec.cacheScope)
+	}
+	return dir
+}
+
 func validateSnapshot(spec sourceSpec, snapshot CatalogSnapshot) error {
 	if !snapshot.Complete || snapshot.SourceID != spec.id || snapshot.Provider != spec.provider || snapshot.Scope != spec.scope || snapshot.FetchedAt.IsZero() || snapshot.CheckedAt.IsZero() || len(snapshot.Pages) == 0 || len(snapshot.Pages) > 1+spec.maxChildren {
 		return errors.New("snapshot incomplete")
@@ -342,14 +449,25 @@ func validateSnapshot(spec sourceSpec, snapshot CatalogSnapshot) error {
 			return errors.New("snapshot page invalid")
 		}
 		urls[page.URL] = true
-		if len(page.Links) > 1000 || len(page.Evidence) > MaxTotalModels {
+		if len(page.Links) > 1000 || len(page.Evidence) > MaxTotalModels || len(page.AvailableModelIDs) > MaxModelsPerAccount {
 			return errors.New("snapshot page exceeds limit")
+		}
+		if spec.catalog && !spec.catalogMayBeEmpty && page.URL == spec.rootURL && len(page.AvailableModelIDs) == 0 {
+			return errors.New("official product model list is missing")
+		}
+		for _, modelID := range page.AvailableModelIDs {
+			if !validModelID(modelID) {
+				return errors.New("official product model ID is invalid")
+			}
 		}
 		for _, evidence := range page.Evidence {
 			if evidence.SourceID != spec.id || evidence.Provider != spec.provider || evidence.Scope != spec.scope || !validModelID(evidence.ModelID) || !validLifecycleStatus(evidence.Status) || evidence.SourceURL != page.URL || evidence.SourceTitle != page.Title || evidence.ContentSHA256 != page.ContentSHA256 || len(evidence.Excerpt) > 360 {
 				return errors.New("snapshot evidence invalid")
 			}
 		}
+	}
+	if err := validateModelStudioPagination(spec, snapshot); err != nil {
+		return err
 	}
 	pageEvidence := make([]LifecycleEvidence, 0)
 	for _, page := range snapshot.Pages {

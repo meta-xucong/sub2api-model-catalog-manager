@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -412,7 +412,9 @@ func TestManualDiscoveryOverridesStalePartialRefreshOnlyInAllAccountPreview(t *t
 	cfg.AcceptAllCredentialResponseMemoryExposure = true
 	cfg.Accounts = nil
 	rules := workflowRules(account)
+	rules.Aliases = []catalog.AliasRule{}
 	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
+	rules.SourceProfiles[0].IdentityCatalogPolicy = "add_identity_from_live_list"
 	writeWorkflowRules(t, cfg.RulesFile, rules)
 	api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known"}, LiveListAvailable: true})
 	previousDay := now.Add(-24 * time.Hour)
@@ -434,6 +436,78 @@ func TestManualDiscoveryOverridesStalePartialRefreshOnlyInAllAccountPreview(t *t
 	}
 	if api.syncCalls != 1 || api.bulkCalls != nil || result.Plan == nil {
 		t.Fatalf("manual preview did not perform exactly one native sync without mapping writes: sync=%d bulk=%v plan=%#v", api.syncCalls, api.bulkCalls, result.Plan)
+	}
+	accountPlan := result.Plan.Accounts[0]
+	if accountPlan.IdentityCatalogPolicy != "add_identity_from_live_list" || !accountPlan.ProductAvailabilityEnforced || accountPlan.ProductAvailabilitySHA256 == "" {
+		t.Fatalf("manual-sync-authorized preview did not enter official-product identity screening: %#v", accountPlan)
+	}
+	if _, imported := accountPlan.After["upstream-known"]; imported || accountPlan.After["untouched"] != "keep-me" || len(accountPlan.Changes) != 0 {
+		t.Fatalf("insufficient official product evidence changed the preview mapping: %#v", accountPlan)
+	}
+}
+
+func TestDiscoveryPreflightBindsManualAuthorizationModeAndConfig(t *testing.T) {
+	cfg, account, now := testWorkflowConfig(t, true, true)
+	cfg.AccountScope = "all"
+	cfg.Target.RuntimeCompatibility.APIContractID = config.APIContractAllAccountsV1
+	cfg.AcceptAllCredentialResponseMemoryExposure = true
+	cfg.Accounts = nil
+	rules := workflowRules(account)
+	rules.Aliases = []catalog.AliasRule{}
+	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
+	rules.SourceProfiles[0].IdentityCatalogPolicy = "add_identity_from_live_list"
+	writeWorkflowRules(t, cfg.RulesFile, rules)
+	api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known"}, LiveListAvailable: true})
+	credentialCalls, clientCalls := 0, 0
+	d := Discoverer{
+		ReadCredential: func(config.CredentialConfig) (securecred.Value, error) {
+			credentialCalls++
+			return securecred.Value{APIKey: []byte("test-admin-key")}, nil
+		},
+		NewClient: func(string) (AdminAPI, error) {
+			clientCalls++
+			return api, nil
+		},
+		Now: func() time.Time { return now }, ManualSyncAuthorized: true,
+	}
+	prepared, err := d.Preflight(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared.ManualSyncAuthorized || prepared.ManualOnlyOnly || prepared.FullScreen || prepared.AccountScope != "all" || prepared.ApplyMode != "preview" || prepared.ConfigFingerprint == "" {
+		t.Fatalf("manual authorized preflight did not bind the exact mode/config: %#v", prepared)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Discoverer, *config.Config)
+	}{
+		{name: "manual authorization removed", mutate: func(d *Discoverer, _ *config.Config) { d.ManualSyncAuthorized = false }},
+		{name: "manual-only mode switched", mutate: func(d *Discoverer, _ *config.Config) { d.ManualOnlyOnly = true }},
+		{name: "full-screen mode switched", mutate: func(d *Discoverer, _ *config.Config) { d.FullScreen = true }},
+		{name: "account scope changed", mutate: func(_ *Discoverer, cfg *config.Config) { cfg.AccountScope = "selected" }},
+		{name: "apply mode changed", mutate: func(_ *Discoverer, cfg *config.Config) { cfg.ApplyMode = "approved_rules" }},
+		{name: "credential exposure acceptance changed", mutate: func(_ *Discoverer, cfg *config.Config) { cfg.AcceptAllCredentialResponseMemoryExposure = false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changedDiscoverer, changedConfig := d, cfg
+			tc.mutate(&changedDiscoverer, &changedConfig)
+			_, err := changedDiscoverer.DiscoverPrepared(context.Background(), changedConfig, prepared)
+			if err == nil || !strings.Contains(err.Error(), "authorization mode or configuration changed after preflight") {
+				t.Fatalf("changed authorization snapshot was accepted: %v", err)
+			}
+			if credentialCalls != 0 || clientCalls != 0 || api.syncCalls != 0 {
+				t.Fatalf("changed snapshot reached credentials or API: credentials=%d clients=%d sync=%d", credentialCalls, clientCalls, api.syncCalls)
+			}
+		})
+	}
+
+	result, err := d.DiscoverPrepared(context.Background(), cfg, prepared)
+	if err != nil {
+		t.Fatalf("unchanged manual authorized all-account preview was rejected: %v", err)
+	}
+	if result.Plan == nil || api.syncCalls != 1 || api.bulkCalls != nil {
+		t.Fatalf("unchanged manual preview did not complete without mapping writes: plan=%#v sync=%d writes=%v", result.Plan, api.syncCalls, api.bulkCalls)
 	}
 }
 
@@ -518,19 +592,19 @@ func TestDiscoveryFallbackEmptyAndWarningsDoNotCreateWritableCatalogPlan(t *test
 	}
 }
 
-func TestDiscoveryRequiresFreshOfficialSelectorAndBindsItIntoApply(t *testing.T) {
-	t.Run("missing snapshot blocks additions", func(t *testing.T) {
+func TestDiscoveryUses404tokenCatalogWithoutOfficialSelector(t *testing.T) {
+	t.Run("missing snapshot does not block live catalog screening", func(t *testing.T) {
 		cfg, account, now := testWorkflowConfig(t, true, true)
 		rules := workflowRules(account)
 		rules.OfficialSelectability = nil
 		writeWorkflowRules(t, cfg.RulesFile, rules)
 		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known", "new-model"}, LiveListAvailable: true})
 		result, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
-		if err != nil || result.Plan == nil || result.Plan.Accounts[0].ApplyEligible || len(result.Plan.Accounts[0].Changes) != 0 || result.Plan.Accounts[0].After["new-model"] != "" {
-			t.Fatalf("missing selector did not fail closed: plan=%#v err=%v", result.Plan, err)
+		if err != nil || result.Plan == nil || !result.Plan.Accounts[0].ApplyEligible || result.Plan.Accounts[0].OfficialSelectabilitySHA256 != "" || result.Plan.Accounts[0].After["canonical-name"] != "upstream-known" || result.Plan.Accounts[0].After["new-model"] != "" {
+			t.Fatalf("successful 404token catalog did not govern the discovery plan: plan=%#v err=%v", result.Plan, err)
 		}
 	})
-	t.Run("expired snapshot blocks additions", func(t *testing.T) {
+	t.Run("expired snapshot does not block live catalog screening", func(t *testing.T) {
 		cfg, account, now := testWorkflowConfig(t, true, true)
 		rules := workflowRules(account)
 		rules.OfficialSelectability[0].ObservedAt = now.UTC().Add(-48 * time.Hour)
@@ -538,11 +612,11 @@ func TestDiscoveryRequiresFreshOfficialSelectorAndBindsItIntoApply(t *testing.T)
 		writeWorkflowRules(t, cfg.RulesFile, rules)
 		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known", "new-model"}, LiveListAvailable: true})
 		result, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
-		if err != nil || result.Plan == nil || result.Plan.Accounts[0].ApplyEligible || len(result.Plan.Accounts[0].Changes) != 0 || result.Plan.Accounts[0].After["new-model"] != "" {
-			t.Fatalf("expired selector did not fail closed: plan=%#v err=%v", result.Plan, err)
+		if err != nil || result.Plan == nil || !result.Plan.Accounts[0].ApplyEligible || result.Plan.Accounts[0].OfficialSelectabilitySHA256 != "" || result.Plan.Accounts[0].After["canonical-name"] != "upstream-known" {
+			t.Fatalf("expired unrelated snapshot blocked 404token catalog screening: plan=%#v err=%v", result.Plan, err)
 		}
 	})
-	t.Run("selector change invalidates approved plan", func(t *testing.T) {
+	t.Run("rules change still invalidates an approved plan", func(t *testing.T) {
 		cfg, account, now := testWorkflowConfig(t, true, true)
 		api := newWorkflowAPI(account, now, adminapi.Catalog{Models: []string{"upstream-known"}, LiveListAvailable: true})
 		discovery, err := workflowDiscoverer(api, now).Discover(context.Background(), cfg)
@@ -874,26 +948,78 @@ func TestOwnerOnlyLifecycleDeltaRejectsEveryNonOwnerChange(t *testing.T) {
 	}
 }
 
-func TestFullScreenOwnerAvailabilityRemovalAppliesOnlyExactOwnedEdge(t *testing.T) {
+func TestFullScreenPreservesMappingsWhenOfficialProductEvidenceIsUnavailable(t *testing.T) {
 	cfg, account, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable"})
 	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
 	if err != nil || discovery.Plan == nil {
 		t.Fatalf("full-screen owner exception discovery failed: plan=%#v err=%v", discovery.Plan, err)
 	}
 	plan := discovery.Plan.Accounts[0]
-	if !plan.ApplyEligible || len(plan.Changes) != 1 || plan.Changes[0].Before != "gpt-5.2" || plan.Changes[0].After != "" || plan.Changes[0].RuleKind != "official_selectability" {
-		t.Fatalf("plan was not limited to the official-selector removal: %#v", plan)
+	if !plan.ApplyEligible || len(plan.Changes) != 0 || plan.After["gpt-5.2"] != "gpt-5.2" || !slices.Contains(plan.UnreviewedModels, "stable") {
+		t.Fatalf("full-screen did not preserve the mapping and block unproven identity import: %#v", plan)
 	}
 	result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
-	if err != nil || !reflect.DeepEqual(result.AppliedIDs, []int64{account.ID}) || len(api.bulkCalls) != 1 {
-		t.Fatalf("full-screen owner-only apply failed: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
+	if err != nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
+		t.Fatalf("full-screen changed mappings without official product evidence: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
 	}
-	if !reflect.DeepEqual(api.bulkMappings[0], map[string]string{"stable": "stable"}) {
-		t.Fatalf("apply changed anything beyond the exact owner edge: %#v", api.bulkMappings[0])
+	if api.accounts[account.ID].ModelMapping["gpt-5.2"] != "gpt-5.2" {
+		t.Fatalf("blocked full-screen run changed the target mapping: %#v", api.accounts[account.ID].ModelMapping)
 	}
 }
 
-func TestOwnerAvailabilityExceptionRequiresOwnedUnchangedMapping(t *testing.T) {
+func TestFullScreenPlansDeletionOnlyAfterAllRelevantExactProbesFail(t *testing.T) {
+	cfg, _, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable"})
+	api.probeOutcomes = map[string]string{"gpt-5.2": "failed", "stable": "succeeded"}
+	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
+	if err != nil || discovery.Plan == nil {
+		t.Fatalf("full-screen probe discovery failed: plan=%#v err=%v", discovery.Plan, err)
+	}
+	plan := discovery.Plan.Accounts[0]
+	if plan.After["stable"] != "stable" {
+		t.Fatalf("successful model was not preserved: %#v", plan.After)
+	}
+	if _, ok := plan.After["gpt-5.2"]; ok {
+		t.Fatalf("model with terminal probe failure was not removed: %#v", plan.After)
+	}
+	if len(discovery.Plan.ModelProbeDecisions) == 0 || discovery.Plan.ModelProbeSHA256 == "" {
+		t.Fatalf("probe outcomes were not bound into the approval plan: %#v", discovery.Plan)
+	}
+	if err := discovery.Plan.ValidateShape(now); err != nil {
+		t.Fatalf("cross-account probe plan failed validation: %v", err)
+	}
+}
+
+func TestFullScreenProductScreeningDoesNotRequireRelayIdentityImportPolicy(t *testing.T) {
+	cfg, _, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable"})
+	rules, err := catalog.LoadRules(cfg.RulesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules.SourceProfiles[0].IdentityCatalogPolicy = ""
+	writeWorkflowRules(t, cfg.RulesFile, rules)
+
+	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
+	if err != nil || discovery.Plan == nil {
+		t.Fatalf("full-screen product screening failed for an API-key relay profile: plan=%#v err=%v", discovery.Plan, err)
+	}
+	if !discovery.Plan.Accounts[0].ProductAvailabilityEnforced {
+		t.Fatalf("full-screen product screening was still coupled to identity import policy: %#v", discovery.Plan.Accounts[0])
+	}
+	var gptProbe *catalog.ModelProbeDecision
+	for i := range discovery.Plan.ModelProbeDecisions {
+		if discovery.Plan.ModelProbeDecisions[i].ModelID == "gpt-5.2" {
+			gptProbe = &discovery.Plan.ModelProbeDecisions[i]
+		}
+	}
+	if gptProbe == nil || gptProbe.Status != "available" {
+		t.Fatalf("insufficient evidence for an existing GPT mapping did not trigger the exact account probe: %#v calls=%v", discovery.Plan.ModelProbeDecisions, api.calls)
+	}
+	if discovery.Plan.Accounts[0].IdentityCatalogPolicy != "" || len(discovery.Plan.Accounts[0].Changes) != 0 {
+		t.Fatalf("product screening unexpectedly enabled identity import or changed mappings: %#v", discovery.Plan.Accounts[0])
+	}
+}
+
+func TestOwnerAvailabilityRulesDoNotBypassMissingUnionEvidence(t *testing.T) {
 	for _, mode := range []string{"unowned", "drifted"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg, account, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable"})
@@ -915,19 +1041,19 @@ func TestOwnerAvailabilityExceptionRequiresOwnedUnchangedMapping(t *testing.T) {
 				t.Fatal(err)
 			}
 			discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
-			if err != nil || discovery.Plan == nil || discovery.Plan.Accounts[0].ApplyEligible || len(discovery.Plan.Accounts[0].Conflicts) == 0 {
-				t.Fatalf("unsafe owner edge did not produce a blocked plan: plan=%#v err=%v", discovery.Plan, err)
+			if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible || len(discovery.Plan.Accounts[0].Changes) != 0 || discovery.Plan.Accounts[0].After["gpt-5.2"] != "gpt-5.2" {
+				t.Fatalf("insufficient union evidence must preserve the existing mapping regardless of ownership: plan=%#v err=%v", discovery.Plan, err)
 			}
 			result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
-			if err == nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
-				t.Fatalf("unsafe owner edge reached a mapping write: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
+			if err != nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
+				t.Fatalf("unproven owner edge changed mappings: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
 			}
 		})
 	}
 }
 
-func TestOfficialSelectabilityOverridesLifecycleDocumentAvailability(t *testing.T) {
-	t.Run("officially selectable live addition remains eligible", func(t *testing.T) {
+func TestFullScreenDoesNotTreat404tokenCatalogAsOfficialEvidence(t *testing.T) {
+	t.Run("404token candidate cannot qualify as official product evidence", func(t *testing.T) {
 		cfg, account, api, now := ownerAvailabilityWorkflowFixture(t, true, []string{"stable", "new-model"})
 		source, err := catalog.SourceForAccount(account.Platform, account.Type, account.Protocol, account.BaseURL, account.ID)
 		if err != nil {
@@ -944,25 +1070,19 @@ func TestOfficialSelectabilityOverridesLifecycleDocumentAvailability(t *testing.
 		}}
 		writeWorkflowRules(t, cfg.RulesFile, rules)
 		discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
-		if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible {
-			t.Fatalf("owner-only removal was blocked instead of deferring live additions: plan=%#v err=%v", discovery.Plan, err)
+		if err != nil || discovery.Plan == nil || discovery.Plan.Accounts[0].ApplyEligible {
+			t.Fatalf("explicit source-rule conflict should block changes: plan=%#v err=%v", discovery.Plan, err)
 		}
-		if discovery.Plan.Accounts[0].IdentityCatalogPolicy != "add_identity_from_live_list" || discovery.Plan.Accounts[0].SourceIdentityAddPolicy != "add_exact" || len(discovery.Plan.Accounts[0].Changes) != 2 {
-			t.Fatalf("official selector did not govern both removal and addition: %#v", discovery.Plan.Accounts[0])
-		}
-		if len(discovery.Report.Discovery) == 0 || !strings.Contains(discovery.Report.Discovery[0].Reason, "selector snapshot is authoritative") {
-			t.Fatalf("report did not explain selector authority over lifecycle documents: plan=%#v report=%#v", discovery.Plan.Accounts[0], discovery.Report.Discovery)
+		if len(discovery.Plan.Accounts[0].Changes) != 0 || discovery.Plan.Accounts[0].After["gpt-5.2"] != "gpt-5.2" || discovery.Plan.Accounts[0].After["new-model"] != "" {
+			t.Fatalf("missing official product source changed an existing or new mapping: %#v", discovery.Plan.Accounts[0])
 		}
 		result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
-		if err != nil || len(result.AppliedIDs) != 1 || len(api.bulkCalls) != 1 {
-			t.Fatalf("owner-only removal did not apply: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
-		}
-		if api.bulkMappings[0]["new-model"] != "new-model" || api.bulkMappings[0]["stable"] != "stable" {
-			t.Fatalf("officially selectable ID was not added: %#v", api.bulkMappings[0])
+		if err == nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
+			t.Fatalf("mapping mutation was allowed without official evidence: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
 		}
 	})
 
-	t.Run("manual-only also uses the official selector", func(t *testing.T) {
+	t.Run("manual-only keeps its add-only mapping boundary", func(t *testing.T) {
 		cfg, _, api, now := ownerAvailabilityWorkflowFixture(t, false, []string{"stable"})
 		cfg.RequireManualOnlyMode = true
 		api.status.Schedule = "04:00"
@@ -974,9 +1094,9 @@ func TestOfficialSelectabilityOverridesLifecycleDocumentAvailability(t *testing.
 		if err != nil || discovery.Plan == nil || !discovery.Plan.Accounts[0].ApplyEligible {
 			t.Fatalf("fresh official selector was incorrectly blocked by lifecycle documents: plan=%#v err=%v", discovery.Plan, err)
 		}
-		result, err := (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, ManualOnlyOnly: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
-		if err != nil || len(result.AppliedIDs) != 1 || len(api.bulkCalls) != 1 {
-			t.Fatalf("manual-only selector-based removal did not apply: result=%#v err=%v writes=%v", result, err, api.bulkCalls)
+		_, err = (Applier{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, ManualOnlyOnly: true}).Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, discovery.PlanSHA256, false)
+		if err != nil || len(api.bulkCalls) != 0 || api.accounts[7].ModelMapping["gpt-5.2"] != "gpt-5.2" {
+			t.Fatalf("manual-only refresh changed a mapping outside its add-only boundary: err=%v writes=%v mapping=%#v", err, api.bulkCalls, api.accounts[7].ModelMapping)
 		}
 	})
 }
@@ -1011,8 +1131,8 @@ func ownerAvailabilityWorkflowFixture(t *testing.T, fullScreen bool, liveModels 
 	rules := ownerAvailabilityRulesFixture()
 	rules.SourceProfiles = []catalog.SourceProfile{{
 		Source: source, BuildID: "test-build", APIContractID: config.APIContractAllAccountsV1, Decision: "approved",
-		OfficialSelectabilityScope: "official-account:test-owner-account",
-		LifecycleScopes:            []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
+		OfficialSelectabilityScope: "official-account:test-owner-account", OfficialSelectabilityProduct: "ui",
+		LifecycleScopes: []string{ownerAvailabilityScope}, IdentityAddPolicy: "add_exact", IdentityCatalogPolicy: "add_identity_from_live_list",
 		Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-14",
 	}}
 	writeWorkflowRules(t, cfg.RulesFile, rules)
@@ -1258,7 +1378,7 @@ func TestManualOnlySkippedAccountSelectionIsExactAndFailClosed(t *testing.T) {
 	}
 }
 
-func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
+func TestManualOnlyRunPlansOnlyExactSkippedAccountsAndPreservesUnprovenModels(t *testing.T) {
 	cfg, selected, now := testWorkflowConfig(t, true, true)
 	now = time.Date(2026, 10, 12, 4, 10, 0, 0, now.Location())
 	selected.ModelMapping = map[string]string{"old-model": "old-model", "still-live": "still-live", "keep-alias": "provider-alias"}
@@ -1324,19 +1444,19 @@ func TestManualOnlyRunSyncsAndAppliesOnlyExactSkippedAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.AppliedIDs) != 1 || result.AppliedIDs[0] != selected.ID || fmt.Sprint(api.bulkCalls) != fmt.Sprint([]int64{selected.ID}) {
-		t.Fatalf("manual-only apply changed wrong accounts: result=%#v calls=%v", result, api.bulkCalls)
+	if len(result.AppliedIDs) != 0 || len(result.NoopIDs) != 1 || result.NoopIDs[0] != selected.ID || len(api.bulkCalls) != 0 {
+		t.Fatalf("manual-only apply should preserve unproven models without writing: result=%#v calls=%v", result, api.bulkCalls)
 	}
 	updated := api.accounts[selected.ID].ModelMapping
-	if updated["old-model"] != "old-model" || updated["new-model"] != "new-model" || updated["still-live"] != "still-live" || updated["keep-alias"] != "provider-alias" {
-		t.Fatalf("officially selectable models were not retained while the live catalog added a new route: %#v", updated)
+	if updated["old-model"] != "old-model" || updated["new-model"] != "" || updated["still-live"] != "still-live" || updated["keep-alias"] != "provider-alias" {
+		t.Fatalf("manual-only mapping did not preserve insufficient official evidence: %#v", updated)
 	}
 	if api.accounts[other.ID].ModelMapping["other-model"] != "other-model" || countCall(api.calls, "sync:8") != 0 {
 		t.Fatal("non-manual account was probed or modified")
 	}
 }
 
-func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(t *testing.T) {
+func TestFullScreenBlocksLiveCatalogIdentityChangesWithoutOfficialProductScope(t *testing.T) {
 	cfg, selected, now := testWorkflowConfig(t, true, true)
 	clock := now
 	advancingNow := func() time.Time {
@@ -1358,6 +1478,23 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(
 	rules.SourceProfiles[0].IdentityAddPolicy = "add_exact"
 	rules.SourceProfiles[0].IdentityCatalogPolicy = "replace_identity_from_live_list"
 	writeWorkflowRules(t, cfg.RulesFile, rules)
+	source, err := catalog.SourceForAccount(selected.Platform, selected.Type, selected.Protocol, selected.BaseURL, selected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := state.Load(filepath.Join(cfg.StateDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := local.Accounts[catalog.AccountKey(selected.ID)]
+	if accountState.ManagedMappings == nil {
+		accountState.ManagedMappings = map[string]state.ManagedMapping{}
+	}
+	accountState.ManagedMappings["stale-model"] = state.ManagedMapping{OriginalValue: "stale-model", LastAppliedValue: "stale-model", SourceFingerprint: catalog.SourceFingerprint(source)}
+	local.Accounts[catalog.AccountKey(selected.ID)] = accountState
+	if err := state.Save(filepath.Join(cfg.StateDir, "state.json"), local); err != nil {
+		t.Fatal(err)
+	}
 	_, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
 	if err != nil {
 		t.Fatal(err)
@@ -1412,21 +1549,28 @@ func TestFullScreenSyncsAndAppliesEligibleAccountsAfterNativeRefreshStatusCheck(
 		t.Fatalf("summary mapping status collapsed unrestricted/empty or shadow accounts: unrestricted=%#v shadow=%#v", discoveryRows[unrestricted.ID], discoveryRows[10])
 	}
 
+	plan := discovery.Plan.Accounts[0]
+	if !plan.ApplyEligible || len(plan.Changes) != 0 || plan.After["new-model"] != "" || plan.After["stale-model"] != "stale-model" || !slices.Contains(plan.UnreviewedModels, "new-model") {
+		t.Fatalf("full-screen did not preserve mappings and block identity imports without official product evidence: %#v", plan)
+	}
+	// The full-account replay now requires every active account detail to
+	// explicitly report its mapping field. Model the unrestricted account's
+	// known empty mapping as an explicit empty object in the Apply-time detail.
+	unrestrictedDetail := api.accounts[unrestricted.ID]
+	unrestrictedDetail.ModelMapping = map[string]string{}
+	unrestrictedDetail.ModelMappingPresent = true
+	api.accounts[unrestricted.ID] = unrestrictedDetail
 	applier := workflowApplier(api, clock)
 	applier.FullScreen = true
 	result, err := applier.Apply(context.Background(), cfg, *discovery.Plan, discovery.PlanSHA256, "", true)
-	if err != nil {
-		t.Fatalf("approved full-screen apply failed: result=%#v err=%v", result, err)
+	if err != nil || len(result.AppliedIDs) != 0 || len(api.bulkCalls) != 0 {
+		t.Fatalf("full-screen wrote live identity changes without official product evidence: result=%#v err=%v calls=%v", result, err, api.bulkCalls)
 	}
-	if !reflect.DeepEqual(result.AppliedIDs, []int64{selected.ID}) || len(api.bulkCalls) != 1 || api.bulkCalls[0] != selected.ID {
-		t.Fatalf("full-screen applied unexpected accounts: result=%#v calls=%v", result, api.bulkCalls)
+	if api.accounts[selected.ID].ModelMapping["stale-model"] != "stale-model" || api.accounts[selected.ID].ModelMapping["new-model"] != "" {
+		t.Fatalf("blocked full-screen changed target mappings: %#v", api.accounts[selected.ID].ModelMapping)
 	}
-	updated := api.accounts[selected.ID].ModelMapping
-	if updated["stale-model"] != "stale-model" || updated["new-model"] != "new-model" || updated["keep-model"] != "keep-model" {
-		t.Fatalf("official selectability should retain stale-but-selectable IDs and add live selectable IDs: %#v", updated)
-	}
-	if api.accounts[unsupported.ID].ModelMapping["manual"] != "preserve" || countCall(api.calls, "status") != 2 {
-		t.Fatalf("full-screen changed an unsupported account or failed to check refresh again before write: calls=%v", api.calls)
+	if api.accounts[unsupported.ID].ModelMapping["manual"] != "preserve" || countCall(api.calls, "status") != 1 {
+		t.Fatalf("full-screen changed an unsupported account or made an unexpected refresh check: calls=%v", api.calls)
 	}
 }
 
@@ -1510,7 +1654,9 @@ func TestFullScreenApplyRechecksNativeRefreshBeforeEveryMappingWrite(t *testing.
 	rules := workflowRules(account1)
 	rules.SourceProfiles[0].Source.AccountID = 0
 	rules.SourceProfiles[0].APIContractID = config.APIContractAllAccountsV1
-	rules.Aliases = []catalog.AliasRule{{Source: rules.SourceProfiles[0].Source, UpstreamID: "new-model", PublicID: "canonical-new", Decision: "approved", Evidence: "exact synthetic test fixture", ReviewedAt: "2026-10-11"}}
+	// Use an existing exact mapped ID: with no official source fixture, the
+	// approved account probe is the evidence that permits this alias.
+	rules.Aliases = []catalog.AliasRule{{Source: rules.SourceProfiles[0].Source, UpstreamID: "old", PublicID: "canonical-new", Decision: "approved", Evidence: "exact synthetic test fixture", ReviewedAt: "2026-10-11"}}
 	writeWorkflowRules(t, cfg.RulesFile, rules)
 	_, hash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
 	if err != nil {
@@ -1521,8 +1667,8 @@ func TestFullScreenApplyRechecksNativeRefreshBeforeEveryMappingWrite(t *testing.
 		status:   adminapi.RefreshStatus{Enabled: true, RunStatus: "completed"},
 		accounts: map[int64]adminapi.Account{account1.ID: account1, account2.ID: account2},
 		catalogs: map[int64]adminapi.Catalog{
-			account1.ID: {Models: []string{"new-model"}, LiveListAvailable: true},
-			account2.ID: {Models: []string{"new-model"}, LiveListAvailable: true},
+			account1.ID: {Models: []string{"old", "new-model"}, LiveListAvailable: true},
+			account2.ID: {Models: []string{"old", "new-model"}, LiveListAvailable: true},
 		},
 	}
 	discovery, err := (Discoverer{ReadCredential: workflowCredential, NewClient: func(string) (AdminAPI, error) { return api, nil }, Now: func() time.Time { return now }, FullScreen: true}).Discover(context.Background(), cfg)
@@ -1644,7 +1790,7 @@ func TestLiveIdentityCatalogRulesRequireManualOnlyBeforeExternalAccess(t *testin
 		},
 		Now: func() time.Time { return now },
 	}).Discover(context.Background(), cfg)
-	if err == nil || !strings.Contains(err.Error(), "live identity catalog rules require manual-only or full-screen mode") || credentialCalls != 0 || clientCalls != 0 {
+	if err == nil || !strings.Contains(err.Error(), "live identity catalog rules require manual-only, full-screen, or manual-sync-authorized mode") || credentialCalls != 0 || clientCalls != 0 {
 		t.Fatalf("identity sync rules did not require manual-only mode before external access: err=%v credentials=%d clients=%d", err, credentialCalls, clientCalls)
 	}
 }
@@ -1678,7 +1824,7 @@ func workflowRules(account adminapi.Account) catalog.Rules {
 	return catalog.Rules{
 		SchemaVersion:           1,
 		Aliases:                 []catalog.AliasRule{{Source: source, UpstreamID: "upstream-known", PublicID: "canonical-name", Decision: "approved", Evidence: "exact reviewed fixture", ReviewedAt: "2026-10-11"}},
-		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:test-openai-account", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
+		SourceProfiles:          []catalog.SourceProfile{{Source: source, BuildID: "test-build", APIContractID: "admin-catalog-v1", Decision: "approved", OfficialSelectabilityScope: "official-account:test-openai-account", OfficialSelectabilityProduct: "ui", IdentityAddPolicy: "add_exact", Evidence: "mock source/build/API compatibility fixture", ReviewedAt: "2026-10-11"}},
 		OfficialSelectability:   []catalog.OfficialSelectability{{Scope: "official-account:test-openai-account", Complete: true, ModelIDs: []string{"upstream-known", "canonical-name", "gpt-5.2", "gpt-5.2-pro", "gpt-5.4", "new-model", "model", "stable", "existing", "unreviewed", "unknown", "brand-new-opaque-id", "claude-haiku-4-5-20251001", "preferred", "snapshot", "canonical", "other", "keep", "keep-me", "still-live", "provider-alias", "old-model", "stale-model", "keep-model", "old"}, ObservedAt: time.Date(2026, 10, 10, 20, 10, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 10, 11, 20, 10, 0, 0, time.UTC), Evidence: "synthetic official account selector fixture"}},
 		CompleteCatalogProfiles: []catalog.CompleteCatalogProfile{},
 		VersionFamilies:         []catalog.VersionFamily{},
@@ -1783,6 +1929,22 @@ func (f *workflowAPI) SyncUpstream(_ context.Context, id int64) (adminapi.Catalo
 	return result, nil
 }
 
+func (f *workflowAPI) ProbeModel(_ context.Context, id int64, modelID string) (adminapi.ModelProbeResult, error) {
+	f.calls = append(f.calls, "probe:"+intString(id)+":"+modelID)
+	if f.probeErrsByAccount != nil && f.probeErrsByAccount[id] != nil {
+		return adminapi.ModelProbeResult{}, f.probeErrsByAccount[id]
+	}
+	if f.probeErrs != nil && f.probeErrs[modelID] != nil {
+		return adminapi.ModelProbeResult{}, f.probeErrs[modelID]
+	}
+	if f.probeOutcomes != nil {
+		if outcome, ok := f.probeOutcomes[modelID]; ok {
+			return adminapi.ModelProbeResult{ModelID: modelID, Outcome: outcome}, nil
+		}
+	}
+	return adminapi.ModelProbeResult{ModelID: modelID, Outcome: "succeeded"}, nil
+}
+
 func (f *workflowAPI) BulkUpdateMapping(_ context.Context, id int64, mapping map[string]string) (adminapi.BulkUpdateResult, error) {
 	f.calls = append(f.calls, "bulk:"+intString(id))
 	f.bulkCalls = append(f.bulkCalls, id)
@@ -1817,12 +1979,321 @@ func (f *workflowAPI) BulkUpdateMapping(_ context.Context, id int64, mapping map
 
 func (f *workflowAPI) Close() {}
 
+func TestResolveInsufficientEvidenceUsesFirstExactSuccessAcrossAccounts(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Status: "available"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+	}
+	api := &workflowAPI{}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}}, {ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Status != "available" || len(decisions[0].Accounts) != 1 {
+		t.Fatalf("unexpected aggregate: %#v", decisions)
+	}
+	if decisions[0].Accounts[0].AccountID != 3 || decisions[0].Accounts[0].Outcome != "succeeded" {
+		t.Fatalf("accounts were not sorted or probing did not stop after success: %#v", decisions[0].Accounts)
+	}
+	if len(api.calls) != 1 || api.calls[0] != "probe:3:gpt-5.5" {
+		t.Fatalf("unexpected probe calls: %v", api.calls)
+	}
+	if err := applyModelProbeEvidence(&plans[1], decisions[0], time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("successful probe did not update the insufficient account: %v", err)
+	}
+	if plans[1].ProductAvailability[0].Status != "available" || plans[1].ProductAvailability[0].MatchKind != "account_probe_success" {
+		t.Fatalf("probe success did not update its own uncertain evidence: %#v", plans[1].ProductAvailability[0])
+	}
+	if err := applyModelProbeEvidence(&plans[0], decisions[0], time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatal("probe success overrode an already official available decision")
+	}
+}
+
+func TestResolveInsufficientEvidenceStopsAfterSuccessAcrossThreeAccounts(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-6-sol", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-6-sol": "gpt-6-sol"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-6-sol", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-6-sol": "gpt-6-sol"}},
+		{AccountID: 12, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-6-sol", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-6-sol": "gpt-6-sol"}},
+	}
+	rows := []report.DiscoveryAccount{
+		{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-6-sol"}}},
+		{ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-6-sol"}}},
+		{ID: 12, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-6-sol"}}},
+	}
+	api := &workflowAPI{probeOutcomes: map[string]string{"gpt-6-sol": "succeeded"}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.calls) != 1 || api.calls[0] != "probe:3:gpt-6-sol" {
+		t.Fatalf("probing continued after exact success: %v", api.calls)
+	}
+	if len(decisions) != 1 || decisions[0].Status != "available" || len(decisions[0].Accounts) != 3 {
+		t.Fatalf("unexpected aggregate: %#v", decisions)
+	}
+	wantOutcomes := []catalog.ModelProbeOutcome{
+		{AccountID: 3, Outcome: "succeeded"},
+		{AccountID: 9, Outcome: "not_attempted_after_success"},
+		{AccountID: 12, Outcome: "not_attempted_after_success"},
+	}
+	for i, want := range wantOutcomes {
+		if decisions[0].Accounts[i] != want {
+			t.Fatalf("account outcomes = %#v, want %#v", decisions[0].Accounts, wantOutcomes)
+		}
+	}
+	if _, err := catalog.ModelProbeDigest(decisions); err != nil {
+		t.Fatalf("valid one-success decision with remaining accounts marked not attempted was rejected: %v", err)
+	}
+}
+
+func TestResolveInsufficientEvidenceRequiresEveryRelevantAccountToFail(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "grok-4.5", Status: "insufficient_evidence"}}, Before: map[string]string{"grok-4.5": "grok-4.5"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "grok-4.5", Status: "unavailable"}}, Before: map[string]string{"grok-4.5": "grok-4.5"}},
+	}
+	api := &workflowAPI{probeOutcomes: map[string]string{"grok-4.5": "failed"}}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "grok-4.5"}}}, {ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "grok-4.5"}}}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Status != "unavailable" || len(decisions[0].Accounts) != 1 || decisions[0].Accounts[0].AccountID != 3 || decisions[0].Accounts[0].Outcome != "failed" {
+		t.Fatalf("model was not marked unavailable after complete failure: %#v", decisions)
+	}
+	if len(api.calls) != 1 || api.calls[0] != "probe:3:grok-4.5" {
+		t.Fatalf("officially unavailable account was probed: %v", api.calls)
+	}
+	if err := applyModelProbeEvidence(&plans[0], decisions[0], time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("terminal probe failure was not attached to the insufficient account: %v", err)
+	}
+	if plans[0].ProductAvailability[0].Status != "unavailable" || plans[0].ProductAvailability[0].MatchKind != "all_account_probes_failed" {
+		t.Fatalf("probe failure did not update its uncertain evidence: %#v", plans[0].ProductAvailability[0])
+	}
+	if plans[1].ProductAvailability[0].Status != "unavailable" {
+		t.Fatalf("probe failure overwrote official unavailability: %#v", plans[1].ProductAvailability[0])
+	}
+}
+
+func TestUnavailableProbeCascadesToEqualOrLowerMappedVersions(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	plan := catalog.Plan{ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{
+		{ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("a", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence", MatchKind: "none"},
+		{ModelID: "gpt-5.5-fast", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.5-openai-compact", Provider: "openai", Status: "insufficient_evidence", MatchKind: "account_probe_ignored", SourceIDs: []string{"404token-account-probe-v1"}, SourceURLs: []string{"https://404token.xyz/api/v1/admin/accounts/{account_id}/test"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when},
+		{ModelID: "gpt-5.6-fast", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("d", 64)}, RetrievedAt: when},
+	}}
+	decision := catalog.ModelProbeDecision{Provider: "openai", ModelID: "gpt-5.5", Status: "unavailable", Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}}}
+	if err := applyModelProbeEvidence(&plan, decision, when); err != nil {
+		t.Fatalf("failed probe did not cascade: %v", err)
+	}
+	availability := make(map[string]catalog.ProductModelAvailability, len(plan.ProductAvailability))
+	for _, item := range plan.ProductAvailability {
+		availability[item.ModelID] = item
+	}
+	if got := availability["gpt-5.4"]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("lower GPT version was not marked unavailable: %+v", got)
+	}
+	for _, id := range []string{"gpt-5.5-fast", "gpt-5.5-openai-compact"} {
+		if got := availability[id]; got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+			t.Fatalf("equal-version GPT variant %s was not marked unavailable: %+v", id, got)
+		}
+	}
+	if got := availability["gpt-5.5"]; got.Status != "unavailable" || got.MatchKind != "all_account_probes_failed" {
+		t.Fatalf("the direct unavailable trigger was not preserved as evidence: %+v", got)
+	}
+	if got := availability["gpt-5.6-fast"]; got.Status != "available" {
+		t.Fatalf("strictly higher GPT version was incorrectly marked unavailable: %+v", got)
+	}
+	if _, err := catalog.ProductAvailabilityDigest(plan.ProductAvailability); err != nil {
+		t.Fatalf("cascaded evidence is not digestible/valid: %v", err)
+	}
+}
+
+func TestGlobalUnavailableProbeCascadesAcrossAccountPlans(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	otherAccountAvailability := []catalog.ProductModelAvailability{{
+		ModelID: "gpt-5.4", Provider: "openai", Status: "available", MatchKind: "exact",
+		SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"},
+		ContentSHA256: []string{strings.Repeat("b", 64)}, RetrievedAt: when,
+	}}
+	decisions := []catalog.ModelProbeDecision{{
+		Provider: "openai", ModelID: "gpt-5.5", Status: "unavailable",
+		Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}, {AccountID: 9, Outcome: "failed"}},
+	}}
+	changed, err := applyGlobalProbeVersionFloors(otherAccountAvailability, decisions, when)
+	if err != nil || !changed {
+		t.Fatalf("global higher-version failure did not propagate: changed=%t err=%v", changed, err)
+	}
+	got := otherAccountAvailability[0]
+	if got.Status != "unavailable" || got.MatchKind != "lower_than_unavailable_version" || got.VersionFloorModelID != "gpt-5.5" {
+		t.Fatalf("lower version on another account did not inherit global failure: %+v", got)
+	}
+	if _, err := catalog.ProductAvailabilityDigest(otherAccountAvailability); err != nil {
+		t.Fatalf("globally cascaded evidence is not valid: %v", err)
+	}
+}
+
+func TestOfficialPositiveScopePreventsProbeFailureFromBecomingGlobalFloor(t *testing.T) {
+	when := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Provider: "openai", Status: "available", MatchKind: "exact", SourceIDs: []string{"openai-chatgpt-models"}, SourceURLs: []string{"https://chatgpt.com/models"}, ContentSHA256: []string{strings.Repeat("c", 64)}, RetrievedAt: when}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+	}
+	rows := []report.DiscoveryAccount{
+		{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}},
+		{ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}},
+	}
+	api := &workflowAPI{probeOutcomes: map[string]string{"gpt-5.5": "failed"}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil || len(decisions) != 1 || decisions[0].Status != "ignored" {
+		t.Fatalf("failed probes overrode a positive exact-ID account scope: decisions=%+v err=%v", decisions, err)
+	}
+	if _, err := catalog.ModelProbeDigest(decisions); err != nil {
+		t.Fatalf("ignored mixed official/probe evidence was not digestible: %v", err)
+	}
+}
+
+func TestResolveInsufficientEvidenceSeparatesProvidersWithSameModelID(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "shared-id", Provider: "openai", Status: "insufficient_evidence"}}, Before: map[string]string{"a": "shared-id"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "shared-id", Provider: "volcengine", Status: "insufficient_evidence"}}, Before: map[string]string{"b": "shared-id"}},
+	}
+	api := &workflowAPI{probeOutcomes: map[string]string{"shared-id": "failed"}}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "shared-id"}}}, {ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "shared-id"}}}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 2 || decisions[0].Provider == decisions[1].Provider {
+		t.Fatalf("same model ID was not separated by provider: %#v", decisions)
+	}
+	for _, decision := range decisions {
+		if len(decision.Accounts) != 1 || decision.Accounts[0].Outcome != "failed" || len(decision.ScopeAccounts) != 2 || decision.ScopeAccounts[0].Reason == decision.ScopeAccounts[1].Reason {
+			t.Fatalf("provider decision crossed account scopes: %#v", decision)
+		}
+		matched := 0
+		for i := range plans {
+			err := applyModelProbeEvidence(&plans[i], decision, time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC))
+			if plans[i].ProductAvailability[0].Provider == decision.Provider {
+				if err != nil {
+					t.Fatalf("matching provider evidence was not updated: %v", err)
+				}
+				matched++
+			} else if err == nil {
+				t.Fatal("probe evidence was attached to a different provider")
+			}
+		}
+		if matched != 1 {
+			t.Fatalf("provider decision updated %d plans", matched)
+		}
+	}
+}
+
+func TestResolveInsufficientEvidenceIgnoresIncompleteModelAndContinues(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "codex-auto-review", Status: "insufficient_evidence", MatchKind: "none"}, {ModelID: "gpt-6-sol", Status: "insufficient_evidence", MatchKind: "none"}}, Before: map[string]string{"codex-auto-review": "codex-auto-review", "gpt-6-sol": "gpt-6-sol"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "codex-auto-review", Status: "insufficient_evidence", MatchKind: "none"}}, Before: map[string]string{"codex-auto-review": "codex-auto-review"}},
+	}
+	api := &workflowAPI{probeErrs: map[string]error{"codex-auto-review": errors.New("probe endpoint unavailable")}}
+	rows := []report.DiscoveryAccount{
+		{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "codex-auto-review"}, {UpstreamID: "gpt-6-sol"}}},
+		{ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "codex-auto-review"}}},
+	}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatalf("incomplete candidate stopped the screening run: %v", err)
+	}
+	if len(decisions) != 2 || decisions[0].ModelID != "codex-auto-review" || decisions[0].Status != "ignored" || decisions[1].ModelID != "gpt-6-sol" || decisions[1].Status != "available" {
+		t.Fatalf("incomplete candidate was not isolated from later screening: %#v", decisions)
+	}
+	if len(api.calls) != 3 || api.calls[0] != "probe:3:codex-auto-review" || api.calls[1] != "probe:9:codex-auto-review" || api.calls[2] != "probe:3:gpt-6-sol" {
+		t.Fatalf("unexpected probe sequence after incomplete results: %v", api.calls)
+	}
+	for i := range plans {
+		if err := applyModelProbeEvidence(&plans[i], decisions[0], time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("ignored evidence was not attached to account %d: %v", plans[i].AccountID, err)
+		}
+		if plans[i].ProductAvailability[0].Status != "insufficient_evidence" || plans[i].ProductAvailability[0].MatchKind != "account_probe_ignored" {
+			t.Fatalf("ignored candidate was treated as available or unavailable for account %d: %#v", plans[i].AccountID, plans[i].ProductAvailability[0])
+		}
+	}
+}
+
+func TestResolveInsufficientEvidenceSkipsIncompleteCandidateAndContinues(t *testing.T) {
+	plans := []catalog.Plan{{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "grok-4.5", Status: "insufficient_evidence"}, {ModelID: "gpt-6-sol", Status: "insufficient_evidence"}}, Before: map[string]string{"grok-4.5": "grok-4.5", "gpt-6-sol": "gpt-6-sol"}}}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "grok-4.5"}, {UpstreamID: "gpt-6-sol"}}}, {ID: 9, Status: "sync_failed", CurrentMappings: []report.Mapping{{UpstreamID: "grok-4.5"}}}}
+	api := &workflowAPI{probeOutcomes: map[string]string{"gpt-6-sol": "succeeded"}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil || len(decisions) != 1 || decisions[0].ModelID != "gpt-6-sol" || decisions[0].Status != "available" || len(api.calls) != 1 || api.calls[0] != "probe:3:gpt-6-sol" {
+		t.Fatalf("incomplete candidate scope stopped or contaminated other screening: decisions=%#v err=%v calls=%v", decisions, err, api.calls)
+	}
+}
+
+func TestResolveInsufficientEvidenceBlocksAllowlistBeforeProbes(t *testing.T) {
+	plans := []catalog.Plan{{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}}}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}}}
+	api := &workflowAPI{}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, false)
+	if err != nil || len(decisions) != 0 || len(api.calls) != 0 {
+		t.Fatalf("incomplete allowlist scope was probed or yielded a decision: decisions=%#v err=%v calls=%v", decisions, err, api.calls)
+	}
+}
+
+func TestResolveInsufficientEvidenceIncompleteThenSuccessIsAvailable(t *testing.T) {
+	plans := []catalog.Plan{
+		{AccountID: 3, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		{AccountID: 9, ProductAvailabilityEnforced: true, ProductAvailability: []catalog.ProductModelAvailability{{ModelID: "gpt-5.5", Status: "insufficient_evidence"}}, Before: map[string]string{"gpt-5.5": "gpt-5.5"}},
+	}
+	api := &workflowAPI{probeErrsByAccount: map[int64]error{3: errors.New("temporary transport failure")}, probeOutcomes: map[string]string{"gpt-5.5": "succeeded"}}
+	rows := []report.DiscoveryAccount{{ID: 3, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}}, {ID: 9, Status: "candidate_reported", CurrentMappings: []report.Mapping{{UpstreamID: "gpt-5.5"}}}}
+	decisions, err := resolveInsufficientEvidence(context.Background(), api, plans, rows, true)
+	if err != nil {
+		t.Fatalf("incomplete account probe stopped screening: %v", err)
+	}
+	if len(decisions) != 1 || decisions[0].Status != "available" || decisions[0].Accounts[0].Outcome != "incomplete" || decisions[0].Accounts[1].Outcome != "succeeded" {
+		t.Fatalf("later successful account did not establish availability: %#v", decisions)
+	}
+}
+
+func TestApplyRevalidatesExactModelAccountScopeWithoutReprobing(t *testing.T) {
+	parentID := int64(3)
+	api := &workflowAPI{accounts: map[int64]adminapi.Account{
+		3:  {ID: 3, Status: "active", ModelMapping: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		9:  {ID: 9, Status: "active", ModelMapping: map[string]string{"alias": "gpt-5.5"}},
+		11: {ID: 11, Status: "inactive", ModelMapping: map[string]string{"gpt-5.5": "gpt-5.5"}},
+		12: {ID: 12, Status: "active", ParentAccountID: &parentID, ModelMapping: map[string]string{"gpt-5.5": "gpt-5.5"}},
+	}}
+	inventory := []adminapi.AccountSummary{{ID: 3}, {ID: 9}, {ID: 11}, {ID: 12}}
+	decisions := []catalog.ModelProbeDecision{{ModelID: "gpt-5.5", Status: "unavailable", ScopeAccounts: []catalog.ModelProbeScopeAccount{{AccountID: 3, Reason: "probe"}, {AccountID: 9, Reason: "probe"}}, Accounts: []catalog.ModelProbeOutcome{{AccountID: 3, Outcome: "failed"}, {AccountID: 9, Outcome: "failed"}}}}
+	if err := verifyModelProbeScope(context.Background(), api, inventory, decisions); err != nil {
+		t.Fatalf("unchanged active/non-shadow scope was rejected: %v", err)
+	}
+	changed := api.accounts[11]
+	changed.Status = "active"
+	api.accounts[11] = changed
+	if err := verifyModelProbeScope(context.Background(), api, inventory, decisions); err == nil {
+		t.Fatal("newly active mapped account was omitted from the approved probe scope")
+	}
+	changed.Status = "inactive"
+	api.accounts[11] = changed
+	api.accounts[13] = adminapi.Account{ID: 13, Status: "active"}
+	inventory = append(inventory, adminapi.AccountSummary{ID: 13})
+	if err := verifyModelProbeScope(context.Background(), api, inventory, decisions); err == nil {
+		t.Fatal("active account with an omitted model_mapping field was accepted as an empty mapping")
+	}
+}
+
 type workflowAPI struct {
 	status                   adminapi.RefreshStatus
 	statusErr                error
 	accounts                 map[int64]adminapi.Account
 	inventoryIDs             []int64
 	catalogs                 map[int64]adminapi.Catalog
+	probeOutcomes            map[string]string
+	probeErrs                map[string]error
+	probeErrsByAccount       map[int64]error
 	calls                    []string
 	syncCalls                int
 	bulkCalls                []int64
@@ -1858,4 +2329,24 @@ func countCall(calls []string, want string) int {
 		}
 	}
 	return n
+}
+
+func TestModelIDBelongsToProductScope(t *testing.T) {
+	tests := []struct {
+		scope, modelID string
+		want           bool
+	}{
+		{"openai_codex_chatgpt_login", "gpt-5.2", true},
+		{"openai_codex_chatgpt_login", "deepseek-flash", false},
+		{"anthropic_claude_code_login", "claude-opus-4-5", true},
+		{"anthropic_claude_code_login", "gpt-5.2", false},
+		{"kimi_code_login", "k3-256k", true},
+		{"kimi_code_login", "kimi-for-coding", true},
+		{"kimi_code_login", "glm-5.3", false},
+	}
+	for _, test := range tests {
+		if got := modelIDBelongsToProductScope(test.scope, test.modelID); got != test.want {
+			t.Errorf("modelIDBelongsToProductScope(%q, %q)=%t want %t", test.scope, test.modelID, got, test.want)
+		}
+	}
 }

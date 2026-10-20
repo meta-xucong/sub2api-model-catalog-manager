@@ -31,6 +31,12 @@ func Read(c config.CredentialConfig) (Value, error) {
 	return readOSCredential(c)
 }
 
+// ReadExternal reads an explicitly configured provider credential reference
+// without consulting the process-wide 404token administrator-key overrides.
+func ReadExternal(c config.CredentialConfig) (Value, error) {
+	return readOSCredential(c)
+}
+
 func (v *Value) Clear() {
 	wipe(v.APIKey)
 	v.APIKey = nil

@@ -23,20 +23,31 @@ const APIContractAllAccountsV1 = "admin-catalog-all-v1"
 var hashPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
 type Config struct {
-	Target                                    TargetConfig     `json:"target"`
-	AccountScope                              string           `json:"account_scope,omitempty"`
-	AcceptAllCredentialResponseMemoryExposure bool             `json:"accept_all_credential_response_memory_exposure,omitempty"`
-	RequireManualOnlyMode                     bool             `json:"require_manual_only_mode,omitempty"`
-	AllowFullScreenMode                       bool             `json:"allow_full_screen_mode,omitempty"`
-	Accounts                                  []AccountConfig  `json:"accounts"`
-	AllowNativeSyncMetadataWrite              bool             `json:"allow_native_sync_metadata_write"`
-	ApplyMode                                 string           `json:"apply_mode"`
-	ApprovedRulesSHA256                       string           `json:"approved_rules_sha256"`
-	Credential                                CredentialConfig `json:"credential"`
-	StateDir                                  string           `json:"state_dir,omitempty"`
-	ReportDir                                 string           `json:"report_dir,omitempty"`
-	BackupDir                                 string           `json:"backup_dir,omitempty"`
-	RulesFile                                 string           `json:"rules_file,omitempty"`
+	Target                                    TargetConfig                  `json:"target"`
+	AccountScope                              string                        `json:"account_scope,omitempty"`
+	AcceptAllCredentialResponseMemoryExposure bool                          `json:"accept_all_credential_response_memory_exposure,omitempty"`
+	RequireManualOnlyMode                     bool                          `json:"require_manual_only_mode,omitempty"`
+	AllowFullScreenMode                       bool                          `json:"allow_full_screen_mode,omitempty"`
+	Accounts                                  []AccountConfig               `json:"accounts"`
+	AllowNativeSyncMetadataWrite              bool                          `json:"allow_native_sync_metadata_write"`
+	ApplyMode                                 string                        `json:"apply_mode"`
+	ApprovedRulesSHA256                       string                        `json:"approved_rules_sha256"`
+	Credential                                CredentialConfig              `json:"credential"`
+	StateDir                                  string                        `json:"state_dir,omitempty"`
+	ReportDir                                 string                        `json:"report_dir,omitempty"`
+	BackupDir                                 string                        `json:"backup_dir,omitempty"`
+	RulesFile                                 string                        `json:"rules_file,omitempty"`
+	OfficialSelectabilitySources              []OfficialSelectabilitySource `json:"official_selectability_sources,omitempty"`
+}
+
+// OfficialSelectabilitySource binds one stable official-account scope to a
+// fixed provider API adapter and an OS-protected API credential reference.
+// Endpoints are intentionally not configurable.
+type OfficialSelectabilitySource struct {
+	Scope      string           `json:"scope"`
+	Provider   string           `json:"provider"`
+	Product    string           `json:"product"`
+	Credential CredentialConfig `json:"credential"`
 }
 
 type TargetConfig struct {
@@ -200,7 +211,52 @@ func (c Config) Validate() error {
 	if strings.ContainsRune(c.RulesFile, '\x00') {
 		return errors.New("rules_file contains an invalid path")
 	}
+	if len(c.OfficialSelectabilitySources) > 100 {
+		return errors.New("official_selectability_sources exceeds the configured limit")
+	}
+	officialScopes := map[string]bool{}
+	for i, source := range c.OfficialSelectabilitySources {
+		if !validOfficialScope(source.Scope) || officialScopes[source.Scope] {
+			return fmt.Errorf("official_selectability_sources[%d] has an invalid or duplicate scope", i)
+		}
+		officialScopes[source.Scope] = true
+		if source.Product != "api" {
+			return fmt.Errorf("official_selectability_sources[%d] must bind an API product; UI selectors require a product-specific adapter", i)
+		}
+		switch source.Provider {
+		case "openai-api", "anthropic-api", "xai-api", "deepseek-api":
+		default:
+			return fmt.Errorf("official_selectability_sources[%d] uses an unsupported provider adapter", i)
+		}
+		credential := source.Credential
+		if (strings.TrimSpace(credential.WindowsCredentialTarget) == "") == (strings.TrimSpace(credential.SystemdCredentialName) == "") {
+			return fmt.Errorf("official_selectability_sources[%d] must configure exactly one OS credential reference", i)
+		}
+		if credential.WindowsCredentialTarget != "" && len(credential.WindowsCredentialTarget) > 256 {
+			return fmt.Errorf("official_selectability_sources[%d] has an invalid Windows credential reference", i)
+		}
+		if credential.SystemdCredentialName != "" && !safeCredentialName(credential.SystemdCredentialName) {
+			return fmt.Errorf("official_selectability_sources[%d] has an invalid systemd credential reference", i)
+		}
+	}
 	return nil
+}
+
+func validOfficialScope(scope string) bool {
+	const prefix = "official-account:"
+	if !strings.HasPrefix(scope, prefix) || len(scope) > 128 || strings.TrimSpace(scope) != scope {
+		return false
+	}
+	alias := strings.TrimPrefix(scope, prefix)
+	if alias == "" || strings.ContainsAny(alias[:1], "._-") {
+		return false
+	}
+	for _, r := range alias {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("-_.", r)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Config) RuntimeCompatible() bool {
@@ -217,6 +273,10 @@ func (c Config) ApplyModeValue() string {
 		return "preview"
 	}
 	return c.ApplyMode
+}
+
+func (c Config) OfficialSelectabilityFile() string {
+	return filepath.Join(c.StateDir, "official-selectability.json")
 }
 
 func (c Config) IDs() []int64 {

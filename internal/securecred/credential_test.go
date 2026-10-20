@@ -39,6 +39,16 @@ func TestReadRejectsMalformedEnvironmentKeyWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestReadExternalNeverUsesAdministratorEnvironmentOverrides(t *testing.T) {
+	t.Setenv("CODEX_404TOKEN_ADMIN_API_KEY", "must-not-be-used-as-provider-key")
+	t.Setenv("SUB2API_ADMIN_API_KEY", "must-not-be-used-either")
+	value, err := ReadExternal(config.CredentialConfig{})
+	if err == nil {
+		value.Clear()
+		t.Fatal("external provider credential inherited the 404token administrator key")
+	}
+}
+
 func TestCredentialClearZerosAPIKey(t *testing.T) {
 	value := Value{APIKey: []byte("clear-me")}
 	underlying := value.APIKey

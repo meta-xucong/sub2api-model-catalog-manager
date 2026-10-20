@@ -2,12 +2,15 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 	_ "time/tzdata"
 
@@ -26,14 +29,302 @@ type DiscoveryResult struct {
 	PlanSHA256 string
 }
 
+const accountProbeSourceID = "404token-account-probe-v1"
+const accountProbeSourceURL = "https://404token.xyz/api/v1/admin/accounts/{account_id}/test"
+
+func resolveInsufficientEvidence(ctx context.Context, client AdminAPI, plans []catalog.Plan, rows []report.DiscoveryAccount, completeAccountScope bool) ([]catalog.ModelProbeDecision, error) {
+	type probeScope struct{ provider, modelID string }
+	keyOf := func(provider, modelID string) string { return provider + "\x00" + modelID }
+	byScope := map[string]map[int64]bool{}
+	scopes := map[string]probeScope{}
+	plansByAccount := make(map[int64]catalog.Plan, len(plans))
+	for _, p := range plans {
+		plansByAccount[p.AccountID] = p
+		for _, evidence := range p.ProductAvailability {
+			if evidence.Status != "insufficient_evidence" || catalog.IsWildcard(evidence.ModelID) {
+				continue
+			}
+			relevant := false
+			for _, mapped := range p.Before {
+				if mapped == evidence.ModelID {
+					relevant = true
+					break
+				}
+			}
+			if !relevant {
+				continue
+			}
+			key := keyOf(evidence.Provider, evidence.ModelID)
+			scopes[key] = probeScope{provider: evidence.Provider, modelID: evidence.ModelID}
+			if byScope[key] == nil {
+				byScope[key] = map[int64]bool{}
+			}
+			byScope[key][p.AccountID] = true
+		}
+	}
+	scopeKeys := make([]string, 0, len(byScope))
+	for key := range byScope {
+		scopeKeys = append(scopeKeys, key)
+	}
+	sort.Strings(scopeKeys)
+	if len(scopeKeys) > 0 && !completeAccountScope {
+		// Without a complete inventory no candidate can be conclusively
+		// removed. Leave all such mappings at insufficient_evidence and allow
+		// unrelated official-evidence screening to finish.
+		return nil, nil
+	}
+	scopeIncomplete := make(map[string]bool, len(scopeKeys))
+	for _, key := range scopeKeys {
+		scope := scopes[key]
+		for _, row := range rows {
+			if row.Status == "skipped_inactive" || row.Status == "skipped_shadow" {
+				continue
+			}
+			for _, mapping := range row.CurrentMappings {
+				if mapping.UpstreamID == scope.modelID {
+					if row.Status != "candidate_reported" {
+						scopeIncomplete[key] = true
+						continue
+					}
+					plan, found := plansByAccount[row.ID]
+					if !found || !plan.ProductAvailabilityEnforced || countProductAvailability(plan.ProductAvailability, scope.modelID) != 1 {
+						scopeIncomplete[key] = true
+						continue
+					}
+					evidence := productAvailability(plan.ProductAvailability, scope.modelID)
+					if evidence.Provider != scope.provider {
+						// The exact ID exists under another official product namespace.
+						// Bind it into the global model scope but never probe it for this provider.
+						continue
+					}
+					if evidence.Status != "insufficient_evidence" {
+						// Official positive and negative decisions are authoritative;
+						// a relay probe may resolve only genuinely inconclusive lines.
+						continue
+					}
+					if byScope[key] == nil {
+						byScope[key] = map[int64]bool{}
+					}
+					byScope[key][row.ID] = true
+				}
+			}
+		}
+	}
+	decisions := make([]catalog.ModelProbeDecision, 0, len(scopeKeys))
+	for _, key := range scopeKeys {
+		scope := scopes[key]
+		if scopeIncomplete[key] {
+			continue
+		}
+		accountIDs := make([]int64, 0, len(byScope[key]))
+		for id := range byScope[key] {
+			accountIDs = append(accountIDs, id)
+		}
+		sort.Slice(accountIDs, func(i, j int) bool { return accountIDs[i] < accountIDs[j] })
+		// Only unresolved official evidence is probed. A fresh official negative
+		// remains authoritative; account probes resolve insufficient evidence.
+		decision := catalog.ModelProbeDecision{Provider: scope.provider, ModelID: scope.modelID, Status: "unavailable", Accounts: make([]catalog.ModelProbeOutcome, 0, len(accountIDs))}
+		officialAvailableInScope := false
+		for _, row := range rows {
+			if row.Status == "skipped_inactive" || row.Status == "skipped_shadow" {
+				continue
+			}
+			for _, mapping := range row.CurrentMappings {
+				if mapping.UpstreamID != scope.modelID {
+					continue
+				}
+				plan, found := plansByAccount[row.ID]
+				if !found || countProductAvailability(plan.ProductAvailability, scope.modelID) != 1 {
+					continue
+				}
+				evidence := productAvailability(plan.ProductAvailability, scope.modelID)
+				reason := "probe"
+				if evidence.Provider != scope.provider {
+					reason = "other_provider"
+				} else {
+					switch evidence.Status {
+					case "available":
+						reason = "official_available"
+					case "unavailable":
+						reason = "official_unavailable"
+					}
+				}
+				decision.ScopeAccounts = append(decision.ScopeAccounts, catalog.ModelProbeScopeAccount{AccountID: row.ID, Reason: reason})
+				if reason == "official_available" {
+					officialAvailableInScope = true
+				}
+				break
+			}
+		}
+		sort.Slice(decision.ScopeAccounts, func(i, j int) bool { return decision.ScopeAccounts[i].AccountID < decision.ScopeAccounts[j].AccountID })
+		incomplete := false
+		successSeen := false
+		for _, accountID := range accountIDs {
+			if successSeen {
+				decision.Accounts = append(decision.Accounts, catalog.ModelProbeOutcome{AccountID: accountID, Outcome: "not_attempted_after_success"})
+				continue
+			}
+			result, err := client.ProbeModel(ctx, accountID, scope.modelID)
+			if err != nil || result.ModelID != scope.modelID || (result.Outcome != "succeeded" && result.Outcome != "failed") {
+				incomplete = true
+				decision.Accounts = append(decision.Accounts, catalog.ModelProbeOutcome{AccountID: accountID, Outcome: "incomplete"})
+				continue
+			}
+			decision.Accounts = append(decision.Accounts, catalog.ModelProbeOutcome{AccountID: accountID, Outcome: result.Outcome})
+			if result.Outcome == "succeeded" {
+				decision.Status = "available"
+				successSeen = true
+			}
+		}
+		if decision.Status != "available" && incomplete {
+			decision.Status = "ignored"
+		}
+		if decision.Status != "available" && officialAvailableInScope {
+			// A positive official exact-ID result is outside the relay probe set,
+			// so failures on only the remaining accounts cannot prove a global
+			// negative or create a cascade floor.
+			decision.Status = "ignored"
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions, nil
+}
+
+func productAvailability(evidence []catalog.ProductModelAvailability, modelID string) catalog.ProductModelAvailability {
+	for _, item := range evidence {
+		if item.ModelID == modelID {
+			return item
+		}
+	}
+	return catalog.ProductModelAvailability{}
+}
+
+func countProductAvailability(evidence []catalog.ProductModelAvailability, modelID string) int {
+	count := 0
+	for _, item := range evidence {
+		if item.ModelID == modelID {
+			count++
+		}
+	}
+	return count
+}
+
+// isProductEvidenceInScope keeps the accepted eligibility sources bound to
+// their product surfaces. Web/login evidence is selected by model namespace,
+// independent of the 404token relay account type. Ark and Bailian evidence is
+// account-platform scoped and must not be reused for another upstream.
+func isProductEvidenceInScope(source catalog.Source, evidence officialcatalog.ProductModelAvailability) bool {
+	switch source.Platform {
+	case "volcengine":
+		return evidence.Provider == "volcengine"
+	case "alibaba":
+		return evidence.Provider == "alibaba"
+	default:
+		switch evidence.Provider {
+		case "openai", "anthropic", "kimi", "xai":
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func modelProbeDecisionDigest(decision catalog.ModelProbeDecision) (string, error) {
+	body, err := json.Marshal(decision)
+	if err != nil {
+		return "", errors.New("model-probe decision could not be hashed")
+	}
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:]), nil
+}
+
+func applyModelProbeEvidence(plan *catalog.Plan, decision catalog.ModelProbeDecision, retrievedAt time.Time) error {
+	if plan == nil || !plan.ProductAvailabilityEnforced {
+		return errors.New("model-probe evidence requires an enforced product-availability plan")
+	}
+	digest, err := modelProbeDecisionDigest(decision)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range plan.ProductAvailability {
+		if plan.ProductAvailability[i].ModelID != decision.ModelID || plan.ProductAvailability[i].Provider != decision.Provider || plan.ProductAvailability[i].Status != "insufficient_evidence" {
+			continue
+		}
+		plan.ProductAvailability[i].Status = decision.Status
+		switch decision.Status {
+		case "available":
+			plan.ProductAvailability[i].MatchKind = "account_probe_success"
+		case "unavailable":
+			plan.ProductAvailability[i].MatchKind = "all_account_probes_failed"
+		case "ignored":
+			plan.ProductAvailability[i].Status = "insufficient_evidence"
+			plan.ProductAvailability[i].MatchKind = "account_probe_ignored"
+		default:
+			return errors.New("model-probe decision has an invalid aggregate status")
+		}
+		plan.ProductAvailability[i].SourceIDs = []string{accountProbeSourceID}
+		plan.ProductAvailability[i].SourceURLs = []string{accountProbeSourceURL}
+		plan.ProductAvailability[i].ContentSHA256 = []string{digest}
+		plan.ProductAvailability[i].RetrievedAt = retrievedAt.UTC()
+		changed = true
+	}
+	if !changed {
+		return errors.New("model-probe evidence does not match the account plan")
+	}
+	catalog.CascadeUnavailableVersions(plan.ProductAvailability)
+	plan.ProductAvailabilitySHA256, err = catalog.ProductAvailabilityDigest(plan.ProductAvailability)
+	return err
+}
+
+func applyGlobalProbeVersionFloors(items []catalog.ProductModelAvailability, decisions []catalog.ModelProbeDecision, retrievedAt time.Time) (bool, error) {
+	combined := append([]catalog.ProductModelAvailability{}, items...)
+	for _, decision := range decisions {
+		if decision.Status != "unavailable" {
+			continue
+		}
+		digest, err := modelProbeDecisionDigest(decision)
+		if err != nil {
+			return false, err
+		}
+		combined = append(combined, catalog.ProductModelAvailability{
+			ModelID: decision.ModelID, Provider: decision.Provider, Status: "unavailable", MatchKind: "all_account_probes_failed",
+			SourceIDs: []string{accountProbeSourceID}, SourceURLs: []string{accountProbeSourceURL}, ContentSHA256: []string{digest}, RetrievedAt: retrievedAt.UTC(),
+		})
+	}
+	catalog.CascadeUnavailableVersions(combined)
+	changed := false
+	for _, cascaded := range combined {
+		if cascaded.MatchKind != "lower_than_unavailable_version" {
+			continue
+		}
+		for i := range items {
+			if items[i].ModelID != cascaded.ModelID || items[i].Provider != cascaded.Provider {
+				continue
+			}
+			if items[i].Status != cascaded.Status || items[i].MatchKind != cascaded.MatchKind || items[i].VersionFloorModelID != cascaded.VersionFloorModelID {
+				items[i] = cascaded
+				changed = true
+			}
+		}
+	}
+	return changed, nil
+}
+
 // DiscoveryPreflight contains the exact validated local rules/state snapshots
 // carried across the startup OEM sync boundary.
 type DiscoveryPreflight struct {
-	Rules      catalog.Rules
-	RulesHash  string
-	LocalState state.State
-	StateHash  string
-	FullScreen bool
+	Rules                       catalog.Rules
+	RulesHash                   string
+	OfficialSelectabilitySHA256 string
+	LocalState                  state.State
+	StateHash                   string
+	FullScreen                  bool
+	ManualOnlyOnly              bool
+	ManualSyncAuthorized        bool
+	AccountScope                string
+	ApplyMode                   string
+	ConfigFingerprint           string
 }
 
 type Discoverer struct {
@@ -165,14 +456,18 @@ func (d Discoverer) Preflight(cfg config.Config) (DiscoveryPreflight, error) {
 	if !cfg.AllowNativeSyncMetadataWrite {
 		return prepared, errors.New("discovery blocked: native sync metadata side effect is disabled")
 	}
-	rules, rulesHash, err := catalog.LoadRulesWithHash(cfg.RulesFile)
+	now := time.Now().UTC()
+	if d.Now != nil {
+		now = d.Now().UTC()
+	}
+	rules, rulesHash, officialHash, err := loadRulesForRun(cfg, d.FullScreen, now)
 	if err != nil {
 		return prepared, err
 	}
-	if !d.ManualOnlyOnly && !d.FullScreen {
+	if !d.ManualOnlyOnly && !d.FullScreen && !d.ManualSyncAuthorized {
 		for _, profile := range rules.SourceProfiles {
 			if profile.IdentityCatalogPolicy != "" {
-				return prepared, errors.New("discovery blocked: live identity catalog rules require manual-only or full-screen mode")
+				return prepared, errors.New("discovery blocked: live identity catalog rules require manual-only, full-screen, or manual-sync-authorized mode")
 			}
 		}
 	}
@@ -198,14 +493,28 @@ func (d Discoverer) Preflight(cfg config.Config) (DiscoveryPreflight, error) {
 	if err != nil {
 		return prepared, err
 	}
-	prepared = DiscoveryPreflight{Rules: rules, RulesHash: rulesHash, LocalState: localState, StateHash: stateHash, FullScreen: d.FullScreen}
+	configFingerprint, err := jsonFingerprint(cfg)
+	if err != nil {
+		return prepared, errors.New("discovery config fingerprint could not be computed")
+	}
+	prepared = DiscoveryPreflight{
+		Rules: rules, RulesHash: rulesHash, OfficialSelectabilitySHA256: officialHash, LocalState: localState, StateHash: stateHash,
+		FullScreen: d.FullScreen, ManualOnlyOnly: d.ManualOnlyOnly, ManualSyncAuthorized: d.ManualSyncAuthorized,
+		AccountScope: cfg.AccountScopeValue(), ApplyMode: cfg.ApplyModeValue(), ConfigFingerprint: configFingerprint,
+	}
 	return prepared, nil
 }
 
 func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, prepared DiscoveryPreflight) (DiscoveryResult, error) {
 	var result DiscoveryResult
-	if prepared.RulesHash == "" || prepared.LocalState.Accounts == nil || prepared.FullScreen != d.FullScreen {
+	if prepared.RulesHash == "" || prepared.LocalState.Accounts == nil || prepared.ConfigFingerprint == "" {
 		return result, errors.New("discovery preflight snapshot is unavailable")
+	}
+	configFingerprint, fingerprintErr := jsonFingerprint(cfg)
+	if fingerprintErr != nil || configFingerprint != prepared.ConfigFingerprint ||
+		prepared.FullScreen != d.FullScreen || prepared.ManualOnlyOnly != d.ManualOnlyOnly || prepared.ManualSyncAuthorized != d.ManualSyncAuthorized ||
+		prepared.AccountScope != cfg.AccountScopeValue() || prepared.ApplyMode != cfg.ApplyModeValue() {
+		return result, errors.New("discovery stopped: authorization mode or configuration changed after preflight")
 	}
 	rules, rulesHash := prepared.Rules, prepared.RulesHash
 	now := time.Now
@@ -217,13 +526,26 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		return result, err
 	}
 	defer lock.Release()
+	if !d.FullScreen {
+		officialLock, err := acquireOfficialSelectabilityLock(cfg)
+		if err != nil {
+			return result, errors.New("discovery blocked: official selectability evidence is being refreshed")
+		}
+		if officialLock != nil {
+			defer officialLock.Release()
+		}
+	}
 	statePath := filepath.Join(cfg.StateDir, "state.json")
 	currentStateHash, hashErr := optionalStateHash(statePath)
 	if hashErr != nil || currentStateHash != prepared.StateHash {
 		return result, errors.New("discovery stopped: local state changed after preflight")
 	}
 	localState := prepared.LocalState
-	if currentRules, currentHash, rulesErr := catalog.LoadRulesWithHash(cfg.RulesFile); rulesErr != nil || currentHash != prepared.RulesHash {
+	checkNow := time.Now().UTC()
+	if d.Now != nil {
+		checkNow = d.Now().UTC()
+	}
+	if currentRules, currentHash, officialHash, rulesErr := loadRulesForRun(cfg, d.FullScreen, checkNow); rulesErr != nil || currentHash != prepared.RulesHash || officialHash != prepared.OfficialSelectabilitySHA256 {
 		return result, errors.New("discovery stopped: local rules changed after preflight")
 	} else {
 		_ = currentRules
@@ -319,6 +641,7 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		accountIDs = scope.IDs
 	}
 	accountReadFailure := false
+	probeAccountPlans := make(map[int64]int)
 	for _, accountID := range accountIDs {
 		if d.ManualOnlyOnly {
 			row, found := refreshRows[accountID]
@@ -412,6 +735,11 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		lifecycleBlockedScopes := make([]string, 0)
 		for _, lifecycleScope := range profile.LifecycleScopes {
 			if officialcatalog.LifecycleScopeReady(d.LifecycleStartup, lifecycleScope, now().UTC()) {
+				if d.FullScreen {
+					if _, found := officialcatalog.CurrentModelCatalog(d.LifecycleStartup, lifecycleScope, now().UTC()); !found {
+						lifecycleBlockedScopes = append(lifecycleBlockedScopes, lifecycleScope)
+					}
+				}
 				continue
 			}
 			lifecycleBlockedScopes = append(lifecycleBlockedScopes, lifecycleScope)
@@ -461,17 +789,54 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		}
 		baseRow.CatalogCompleteness = string(completeness)
 		local := localState.Accounts[catalog.AccountKey(account.ID)]
-		lifecycleExclusions := buildLifecycleExclusions(rules, profile.LifecycleScopes, d.LifecycleStartup, now().UTC())
+		candidateModelIDs := append([]string{}, catalogResult.Models...)
+		for _, upstreamID := range account.ModelMapping {
+			candidateModelIDs = append(candidateModelIDs, upstreamID)
+		}
+		lifecycleExclusions := buildLifecycleExclusions(profile.LifecycleScopes, d.LifecycleStartup, now().UTC())
 		baseRow.LifecycleExclusions = append([]catalog.LifecycleExclusion{}, lifecycleExclusions...)
 		identityAddPolicy := profile.IdentityAddPolicy
+		// Product eligibility is independent of the relay account's identity
+		// import policy. Full-screen runs must evaluate accepted web/login
+		// product evidence for exact model IDs even when the 404token source is
+		// an API-key relay account.
+		productAvailabilityEnforced := d.ManualOnlyOnly || d.FullScreen || d.ManualSyncAuthorized
+		productAvailability := []catalog.ProductModelAvailability{}
+		if productAvailabilityEnforced {
+			availability := officialcatalog.EvaluateProductAvailability(d.LifecycleStartup, candidateModelIDs, now().UTC())
+			switch source.Platform {
+			case "volcengine":
+				availability = officialcatalog.EvaluateArkAccountAvailability(d.LifecycleStartup, source.Platform, candidateModelIDs, now().UTC())
+			case "alibaba":
+				availability = officialcatalog.EvaluateAlibabaModelStudioAvailability(d.LifecycleStartup, source.Platform, source.BaseURL, candidateModelIDs, now().UTC())
+			}
+			for _, evidence := range availability {
+				if profile.IdentityCatalogPolicy == "" && !isProductEvidenceInScope(source, evidence) {
+					continue
+				}
+				if catalog.IsWildcard(evidence.ModelID) {
+					continue
+				}
+				productAvailability = append(productAvailability, catalog.ProductModelAvailability{
+					ModelID: evidence.ModelID, Provider: evidence.Provider, Status: evidence.Status, MatchKind: evidence.MatchKind,
+					SourceIDs: append([]string(nil), evidence.SourceIDs...), SourceURLs: append([]string(nil), evidence.SourceURLs...),
+					ContentSHA256: append([]string(nil), evidence.ContentSHA256...), RetrievedAt: evidence.RetrievedAt,
+					VersionFloorModelID: evidence.VersionFloorModelID,
+				})
+			}
+			catalog.CascadeUnavailableVersions(productAvailability)
+		}
 		plan, err := catalog.Normalize(rules, catalog.Input{
 			AccountID: account.ID, Source: source, SourceIdentityAddPolicy: identityAddPolicy,
-			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (d.ManualOnlyOnly || d.FullScreen) && profile.IdentityCatalogPolicy != "",
+			IdentityCatalogPolicy: profile.IdentityCatalogPolicy, AllowIdentityCatalogSync: (d.ManualOnlyOnly || d.FullScreen || d.ManualSyncAuthorized) && profile.IdentityCatalogPolicy != "",
 			CurrentMapping: account.ModelMapping, ManagedMappings: local.ManagedMappings,
 			LiveModels: catalogResult.Models, LiveListAvailable: catalogResult.LiveListAvailable,
 			Completeness: completeness, CompletenessProfileID: completeProfileID, DirectoryHash: directoryHash,
-			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: nil,
-			RequireOfficialSelectability: true, OfficialSelectabilityScope: profile.OfficialSelectabilityScope, Now: now().UTC(),
+			LifecycleScopes: profile.LifecycleScopes, LifecycleExclusions: lifecycleExclusions,
+			ProductAvailabilityEnforced: productAvailabilityEnforced, ProductAvailability: productAvailability,
+			RequireOfficialSelectability: false,
+			PruneMissingMappings:         false,
+			Now:                          now().UTC(),
 		}, local)
 		if err != nil {
 			return result, err
@@ -479,14 +844,17 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		plan.CatalogObservedAt = observedAt
 		plan.CompletenessProfileID = completeProfileID
 		plan.CatalogWarningCodes = append([]string{}, warningCodes...)
-		if len(lifecycleBlockedScopes) > 0 {
-			baseRow.Reason = "official selector snapshot is authoritative; product lifecycle documents are informational only"
-		}
+		// Product availability is evaluated per exact model ID across all
+		// accepted vendor surfaces. A stale unrelated lifecycle source or a
+		// missing account-specific product scope must not block a model that has
+		// fresh exact positive evidence; missing evidence is already fail-closed
+		// in Normalize for that individual ID.
 		if catalogWarningCodesBlockMappingApply(warningCodes) {
 			plan.ApplyEligible = false
 			plan.DiscoveryReason = "catalog response contains warnings that may affect the model-ID list"
 		}
 		baseRow.Changes = make([]report.MappingChange, 0, len(plan.Changes))
+		baseRow.ProductAvailability = reportAvailability(plan.ProductAvailability)
 		for _, change := range plan.Changes {
 			baseRow.Changes = append(baseRow.Changes, report.MappingChange{Action: change.Action, PublicID: change.PublicID, Before: change.Before, After: change.After, RuleKind: change.RuleKind, Evidence: change.Evidence, Reason: change.Reason})
 		}
@@ -502,6 +870,89 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 		local.LastSuccessAt = &successAt
 		localState.Accounts[catalog.AccountKey(account.ID)] = local
 		approval.Accounts = append(approval.Accounts, plan)
+		probeAccountPlans[accountID] = len(approval.Accounts) - 1
+	}
+	if !accountReadFailure && len(approval.Accounts) > 0 {
+		decisions, probeErr := resolveInsufficientEvidence(ctx, client, approval.Accounts, doc.Discovery, cfg.AllAccounts())
+		if probeErr != nil {
+			return result, probeErr
+		}
+		approval.ModelProbeDecisions = decisions
+		if len(decisions) > 0 {
+			approval.ModelProbeSHA256, err = catalog.ModelProbeDigest(decisions)
+			if err != nil {
+				return result, err
+			}
+			for accountID, planIndex := range probeAccountPlans {
+				p := approval.Accounts[planIndex]
+				changed := false
+				for _, decision := range decisions {
+					for _, mappedID := range p.Before {
+						if mappedID != decision.ModelID {
+							continue
+						}
+						evidence := productAvailability(p.ProductAvailability, decision.ModelID)
+						if evidence.Provider != decision.Provider || evidence.Status != "insufficient_evidence" {
+							continue
+						}
+						if err = applyModelProbeEvidence(&p, decision, now()); err != nil {
+							return result, err
+						}
+						changed = true
+						break
+					}
+				}
+				// Probe results are aggregated across all accounts. Use those global
+				// negative decisions as candidate floors even when this particular
+				// account does not itself map the higher version.
+				cascaded, cascadeErr := applyGlobalProbeVersionFloors(p.ProductAvailability, decisions, now())
+				if cascadeErr != nil {
+					return result, cascadeErr
+				}
+				changed = changed || cascaded
+				if !changed {
+					continue
+				}
+				local := localState.Accounts[catalog.AccountKey(accountID)]
+				prior := local
+				prior.AbsenceCounts = cloneCounterMap(p.AbsenceCountsBefore)
+				verified, normalizeErr := catalog.Normalize(rules, catalog.Input{
+					AccountID: p.AccountID, Source: p.Source, SourceIdentityAddPolicy: p.SourceIdentityAddPolicy,
+					IdentityCatalogPolicy: p.IdentityCatalogPolicy, AllowIdentityCatalogSync: (d.ManualOnlyOnly || d.FullScreen || d.ManualSyncAuthorized) && p.IdentityCatalogPolicy != "",
+					CurrentMapping: p.Before, ManagedMappings: local.ManagedMappings, LiveModels: p.CatalogModels, LiveListAvailable: p.LiveListAvailable,
+					Completeness: p.Completeness, CompletenessProfileID: p.CompletenessProfileID, DirectoryHash: p.DirectoryHash,
+					LifecycleScopes: p.LifecycleScopes, LifecycleExclusions: p.LifecycleExclusions,
+					ProductAvailabilityEnforced: p.ProductAvailabilityEnforced, ProductAvailability: p.ProductAvailability,
+					RequireOfficialSelectability: false, PruneMissingMappings: false, Now: now().UTC(),
+				}, prior)
+				if normalizeErr != nil {
+					return result, normalizeErr
+				}
+				verified.CatalogObservedAt = p.CatalogObservedAt
+				verified.CompletenessProfileID = p.CompletenessProfileID
+				verified.CatalogWarningCodes = append([]string{}, p.CatalogWarningCodes...)
+				if catalogWarningCodesBlockMappingApply(p.CatalogWarningCodes) {
+					verified.ApplyEligible = false
+					verified.DiscoveryReason = "catalog response contains warnings that may affect the model-ID list"
+				}
+				approval.Accounts[planIndex] = verified
+				local.AbsenceCounts = cloneCounterMap(verified.AbsenceCountsAfter)
+				localState.Accounts[catalog.AccountKey(accountID)] = local
+				for rowIndex := range doc.Discovery {
+					if doc.Discovery[rowIndex].ID != accountID || doc.Discovery[rowIndex].Status != "candidate_reported" {
+						continue
+					}
+					doc.Discovery[rowIndex].Changes = make([]report.MappingChange, 0, len(verified.Changes))
+					for _, c := range verified.Changes {
+						doc.Discovery[rowIndex].Changes = append(doc.Discovery[rowIndex].Changes, report.MappingChange{Action: c.Action, PublicID: c.PublicID, Before: c.Before, After: c.After, RuleKind: c.RuleKind, Evidence: c.Evidence, Reason: c.Reason})
+					}
+					doc.Discovery[rowIndex].ProductAvailability = reportAvailability(verified.ProductAvailability)
+					doc.Discovery[rowIndex].Conflicts = append([]string{}, verified.Conflicts...)
+					doc.Discovery[rowIndex].UnreviewedModels = append([]string{}, verified.UnreviewedModels...)
+					break
+				}
+			}
+		}
 	}
 	if !accountReadFailure {
 		if err := state.Save(statePath, localState); err != nil {
@@ -532,6 +983,20 @@ func (d Discoverer) DiscoverPrepared(ctx context.Context, cfg config.Config, pre
 	doc.Sort()
 	result.Report = doc
 	return result, nil
+}
+
+func reportAvailability(items []catalog.ProductModelAvailability) []report.ProductAvailabilityEvidence {
+	out := make([]report.ProductAvailabilityEvidence, 0, len(items))
+	for _, item := range items {
+		out = append(out, report.ProductAvailabilityEvidence{ModelID: item.ModelID, Provider: item.Provider, Status: item.Status, MatchKind: item.MatchKind})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ModelID != out[j].ModelID {
+			return out[i].ModelID < out[j].ModelID
+		}
+		return out[i].Provider < out[j].Provider
+	})
+	return out
 }
 
 // ownerOnlyNormalizationRules prevents unrelated alias, family, retirement,
@@ -645,11 +1110,7 @@ func cloneCounterMap(src map[string]int) map[string]int {
 	return dst
 }
 
-func buildLifecycleExclusions(rules catalog.Rules, scopes []string, startup officialcatalog.StartupSyncResult, now time.Time) []catalog.LifecycleExclusion {
-	enabled := make(map[string]bool, len(scopes))
-	for _, scope := range scopes {
-		enabled[scope] = true
-	}
+func buildLifecycleExclusions(scopes []string, startup officialcatalog.StartupSyncResult, now time.Time) []catalog.LifecycleExclusion {
 	byExact := make(map[string]catalog.LifecycleExclusion)
 	for _, evidence := range officialcatalog.AutomaticExclusions(startup, scopes, now) {
 		item := catalog.LifecycleExclusion{
@@ -659,20 +1120,6 @@ func buildLifecycleExclusions(rules catalog.Rules, scopes []string, startup offi
 			ContentSHA256: evidence.ContentSHA256, Excerpt: evidence.Excerpt,
 		}
 		byExact[item.Scope+"\x00"+item.ModelID+"\x00"+item.SourceID] = item
-	}
-	covered := make(map[string]bool)
-	for _, item := range byExact {
-		covered[item.Scope+"\x00"+item.ModelID] = true
-	}
-	for _, owner := range rules.OwnerLifecycleExclusions {
-		if !enabled[owner.Scope] || covered[owner.Scope+"\x00"+owner.ModelID] {
-			continue
-		}
-		item := catalog.LifecycleExclusion{
-			Scope: owner.Scope, ModelID: owner.ModelID, Status: "owner_confirmed_unavailable",
-			SourceTitle: "Owner-confirmed model availability", Excerpt: owner.Evidence, OwnerRule: true,
-		}
-		byExact[item.Scope+"\x00"+item.ModelID+"\x00owner"] = item
 	}
 	out := make([]catalog.LifecycleExclusion, 0, len(byExact))
 	for _, item := range byExact {
@@ -688,6 +1135,23 @@ func buildLifecycleExclusions(rules catalog.Rules, scopes []string, startup offi
 		return out[i].SourceID < out[j].SourceID
 	})
 	return out
+}
+
+func modelIDBelongsToProductScope(scope, modelID string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	switch scope {
+	case "openai_codex_chatgpt_login":
+		return strings.HasPrefix(modelID, "gpt-")
+	case "anthropic_claude_code_login":
+		return strings.HasPrefix(modelID, "claude-")
+	case "kimi_code_login":
+		if strings.HasPrefix(modelID, "kimi-") {
+			return true
+		}
+		return regexp.MustCompile(`^k[0-9]+(?:-[0-9]+k)?$`).MatchString(modelID)
+	default:
+		return false
+	}
 }
 
 func (d Discoverer) waitForCurrentRefresh(ctx context.Context, client AdminAPI, current adminapi.RefreshStatus, now func() time.Time) (adminapi.RefreshStatus, error) {
